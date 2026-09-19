@@ -244,6 +244,45 @@ async fn a_task_that_fails_after_being_accepted_is_reported_not_acknowledged() {
     .await;
 }
 
+/// What `mqb copy … meilisearch://…` actually hands the endpoint.
+///
+/// The CLI derives a plugin endpoint's `url` from the URI up to the query and
+/// makes every query parameter a string, so this config is built the same way
+/// rather than in its typed form. If this breaks, the CLI is broken.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn the_config_the_cli_builds_from_a_uri_works() {
+    run_test_with_docker("tests/docker-compose.yml", || async {
+        let factory = factory();
+        let index = index_name("cli-uri");
+        // meilisearch://localhost:7700?index=…&primary_key=id&api_key=…&create_index=true
+        let config = serde_json::json!({
+            "url": "meilisearch://localhost:7700",
+            "index": index,
+            "primary_key": "id",
+            "api_key": API_KEY,
+            "create_index": "true",
+            "wait_for_task": "true",
+            "task_timeout_ms": "30000",
+        });
+
+        factory
+            .create_publisher(&index, &config)
+            .await
+            .expect("the CLI's URI-derived config should build a publisher")
+            .send_batch(vec![document(1, "one", None)])
+            .await
+            .expect("publish through the CLI-shaped config");
+
+        let mut consumer = factory
+            .create_consumer(&index, &config)
+            .await
+            .expect("create Meilisearch consumer");
+        assert_eq!(ids(&read_all(&mut *consumer).await), vec![1]);
+    })
+    .await;
+}
+
 /// A nacked batch rolls the scan position back, so its documents are read
 /// again rather than skipped.
 #[tokio::test]

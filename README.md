@@ -225,6 +225,39 @@ cargo run --features example-app --example file_to_meilisearch
 The runnable route is in `examples/file_to_meilisearch.yaml`; it loads the three
 documents in `examples/movies.jsonl` into an index.
 
+## From the command line
+
+The `mqb` CLI addresses this endpoint by URI, loading the plugin with
+`--plugin` (or a `plugins:` entry in its config file):
+
+```console
+mqb copy --drain --plugin ./libmq_bridge_meilisearch.so \
+  'file://movies.jsonl?format=raw' \
+  'meilisearch://localhost:7700?index=movies&primary_key=id&api_key=KEY'
+```
+
+The `meilisearch://` scheme is rewritten to `http://` (and `meilisearchs://` to
+`https://`), so the URI reads the way every other endpoint's does. An explicit
+`?url=https://…` still overrides it, which is what a Meilisearch Cloud instance
+behind a path wants.
+
+A URI query carries no types, so every option arrives as a string. The options
+that are not strings accept that spelling too — `create_index=false`,
+`task_timeout_ms=30000`, `delete_values=delete,remove` all work — and a YAML
+route keeps using the typed forms.
+
+Streaming from Postgres is the same URI on the output side:
+
+```console
+mqb copy --plugin ./libmq_bridge_meilisearch.so \
+  'postgres-cdc://user:pass@host:5432/app?publication=movies_pub&slot_name=mqb_meili' \
+  'meilisearch://localhost:7700?index=movies&primary_key=id&api_key=KEY&operation=${metadata:postgres.operation}'
+```
+
+Note that a CDC route indexes **changes only** — rows already in the table are
+not sent, so an existing table needs a one-off backfill copy before the stream
+is started.
+
 ## Use it from any mq-bridge process
 
 The crate also builds a `cdylib` — the same endpoint as a native plugin — so a
@@ -297,8 +330,9 @@ The unit tests need nothing. Both other files start a Meilisearch container from
 
 `integration.rs` covers the directly linked endpoint: an upsert/delete round
 trip, an insert and a delete of one key in a single batch, the cross-table merge
-above, a task that fails *after* being accepted, a nacked batch being re-read,
-and a checkpointed scan resuming where it stopped.
+above, a task that fails *after* being accepted, a nacked batch being re-read, a
+checkpointed scan resuming where it stopped, and the exact config shape the CLI
+builds from a `meilisearch://` URI.
 
 `plugin.rs` runs one suite twice against the same instance — once against the
 directly linked factory, once against the factory loaded from the compiled

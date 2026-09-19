@@ -25,6 +25,87 @@ impl WriteMethod {
     }
 }
 
+/// Every value in a CLI endpoint URI arrives as a string — a query string
+/// carries no types — so the scalar options accept both their real JSON form
+/// and its spelling. A YAML route is unaffected; it already has types.
+mod flexible {
+    use serde::{de::Error, Deserialize, Deserializer};
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum BoolOrText {
+        Bool(bool),
+        Text(String),
+    }
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum IntOrText {
+        Int(u64),
+        Text(String),
+    }
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum ListOrText {
+        List(Vec<String>),
+        Text(String),
+    }
+
+    fn parse_bool<E: Error>(text: &str) -> Result<bool, E> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "true" => Ok(true),
+            "false" => Ok(false),
+            _ => Err(E::custom(format!("expected true or false, found '{text}'"))),
+        }
+    }
+
+    fn parse_int<E: Error>(text: &str) -> Result<u64, E> {
+        text.trim()
+            .parse()
+            .map_err(|_| E::custom(format!("expected a whole number, found '{text}'")))
+    }
+
+    pub(super) fn boolean<'de, D: Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
+        match BoolOrText::deserialize(deserializer)? {
+            BoolOrText::Bool(value) => Ok(value),
+            BoolOrText::Text(text) => parse_bool(&text),
+        }
+    }
+
+    pub(super) fn integer<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
+        match IntOrText::deserialize(deserializer)? {
+            IntOrText::Int(value) => Ok(value),
+            IntOrText::Text(text) => parse_int(&text),
+        }
+    }
+
+    pub(super) fn optional_integer<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<u64>, D::Error> {
+        match Option::<IntOrText>::deserialize(deserializer)? {
+            None => Ok(None),
+            Some(IntOrText::Int(value)) => Ok(Some(value)),
+            Some(IntOrText::Text(text)) => parse_int(&text).map(Some),
+        }
+    }
+
+    /// A list, or the comma-separated spelling a URI can carry.
+    pub(super) fn string_list<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<String>, D::Error> {
+        Ok(match ListOrText::deserialize(deserializer)? {
+            ListOrText::List(values) => values,
+            ListOrText::Text(text) => text
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .collect(),
+        })
+    }
+}
+
 fn default_true() -> bool {
     true
 }
@@ -68,23 +149,29 @@ pub struct MeilisearchConfig {
     #[serde(default)]
     pub operation: Option<String>,
     /// Output only: operation values that mean "remove this document".
-    #[serde(default = "default_delete_values")]
+    #[serde(
+        default = "default_delete_values",
+        deserialize_with = "flexible::string_list"
+    )]
     pub delete_values: Vec<String>,
     /// Create the index at startup if it does not exist, so `primary_key` is
     /// applied before the first document rather than inferred from it.
-    #[serde(default = "default_true")]
+    #[serde(default = "default_true", deserialize_with = "flexible::boolean")]
     pub create_index: bool,
     /// Output only: wait for the asynchronous task each write enqueues to
     /// finish before acknowledging. Turning this off acknowledges on enqueue,
     /// which commits the source cursor for writes that may still fail.
-    #[serde(default = "default_true")]
+    #[serde(default = "default_true", deserialize_with = "flexible::boolean")]
     pub wait_for_task: bool,
     /// How long to wait for one enqueued task, in milliseconds.
-    #[serde(default = "default_task_timeout_ms")]
+    #[serde(
+        default = "default_task_timeout_ms",
+        deserialize_with = "flexible::integer"
+    )]
     pub task_timeout_ms: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "flexible::optional_integer")]
     pub connect_timeout_ms: Option<u64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "flexible::optional_integer")]
     pub request_timeout_ms: Option<u64>,
     /// Input only: comma-separated document fields to return; all by default.
     #[serde(default)]
@@ -98,12 +185,34 @@ pub struct MeilisearchConfig {
     #[serde(default)]
     pub checkpoint_store: Option<String>,
     /// Input only: delay between polls once the scan has reached the end.
-    #[serde(default = "default_polling_interval_ms")]
+    #[serde(
+        default = "default_polling_interval_ms",
+        deserialize_with = "flexible::integer"
+    )]
     pub polling_interval_ms: u64,
     /// Input only: upper bound the idle delay backs off to; no backoff by
     /// default, so the reader keeps polling at `polling_interval_ms`.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "flexible::optional_integer")]
     pub max_polling_interval_ms: Option<u64>,
+}
+
+/// Rewrites a `meilisearch://` URL to the HTTP one Meilisearch actually speaks.
+///
+/// The CLI builds a plugin endpoint's `url` from the URI up to the query, so a
+/// route written as `meilisearch://host:7700` arrives with that scheme rather
+/// than an HTTP one. Anything else is passed through untouched, so an explicit
+/// `http(s)://` URL — or a `?url=` override — still wins.
+fn normalize_url(url: &str) -> String {
+    let url = url.trim();
+    for (scheme, http) in [
+        ("meilisearchs://", "https://"),
+        ("meilisearch://", "http://"),
+    ] {
+        if let Some(rest) = url.strip_prefix(scheme) {
+            return format!("{http}{rest}");
+        }
+    }
+    url.to_owned()
 }
 
 /// A rejected configuration cannot heal by reconnecting, so both constructors
@@ -129,8 +238,9 @@ fn resolve(
     route_name: &str,
     value: &serde_json::Value,
 ) -> anyhow::Result<(MeilisearchConfig, String)> {
-    let config: MeilisearchConfig = serde_json::from_value(value.clone())
+    let mut config: MeilisearchConfig = serde_json::from_value(value.clone())
         .context("invalid Meilisearch endpoint configuration")?;
+    config.url = normalize_url(&config.url);
     if config.url.trim().is_empty() {
         return Err(anyhow!("Meilisearch `url` must not be empty"));
     }
@@ -213,6 +323,79 @@ mod tests {
         assert!(resolve("route", &serde_json::json!({"url": ""})).is_err());
         assert!(resolve("route", &value(serde_json::json!({"extra": true}))).is_err());
         assert!(resolve("route", &value(serde_json::json!({"task_timeout_ms": 0}))).is_err());
+    }
+
+    /// `mqb copy … meilisearch://host:7700?index=movies` derives `url` from the
+    /// URI up to the query, so the endpoint has to accept its own scheme.
+    #[test]
+    fn a_meilisearch_scheme_url_becomes_the_http_one() {
+        let (config, _) = resolve(
+            "route",
+            &serde_json::json!({"url": "meilisearch://localhost:7700"}),
+        )
+        .unwrap();
+        assert_eq!(config.url, "http://localhost:7700");
+
+        let (secure, _) = resolve(
+            "route",
+            &serde_json::json!({"url": "meilisearchs://search.example.com"}),
+        )
+        .unwrap();
+        assert_eq!(secure.url, "https://search.example.com");
+    }
+
+    #[test]
+    fn an_http_url_is_left_alone() {
+        let (config, _) = resolve("route", &value(serde_json::json!({}))).unwrap();
+        assert_eq!(config.url, "http://localhost:7700");
+    }
+
+    /// A URI query carries no types, so every option arrives as a string.
+    #[test]
+    fn scalar_options_accept_the_string_spelling_a_uri_carries() {
+        let (config, _) = resolve(
+            "route",
+            &value(serde_json::json!({
+                "create_index": "false",
+                "wait_for_task": "TRUE",
+                "task_timeout_ms": "30000",
+                "connect_timeout_ms": "250",
+                "delete_values": "delete, remove",
+            })),
+        )
+        .unwrap();
+
+        assert!(!config.create_index);
+        assert!(config.wait_for_task);
+        assert_eq!(config.task_timeout_ms, 30_000);
+        assert_eq!(config.connect_timeout_ms, Some(250));
+        assert_eq!(
+            config.delete_values,
+            vec!["delete".to_owned(), "remove".to_owned()]
+        );
+    }
+
+    #[test]
+    fn the_typed_forms_still_work_and_nonsense_is_still_rejected() {
+        let (config, _) = resolve(
+            "route",
+            &value(serde_json::json!({
+                "create_index": false,
+                "task_timeout_ms": 30000,
+                "delete_values": ["delete"],
+            })),
+        )
+        .unwrap();
+        assert!(!config.create_index);
+        assert_eq!(config.task_timeout_ms, 30_000);
+        assert_eq!(config.delete_values, vec!["delete".to_owned()]);
+
+        assert!(resolve("route", &value(serde_json::json!({"create_index": "yes"}))).is_err());
+        assert!(resolve(
+            "route",
+            &value(serde_json::json!({"task_timeout_ms": "soon"}))
+        )
+        .is_err());
     }
 
     #[test]
