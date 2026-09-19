@@ -12,6 +12,7 @@ include = [
     "/examples/**",
     "/Cargo.toml",
     "/README.md",
+    "/CONTRIBUTING.md",
     "/LICENSE-MIT",
     "/LICENSE-APACHE",
 ]

@@ -364,3 +364,170 @@ async fn a_checkpointed_scan_resumes_where_it_stopped() {
     })
     .await;
 }
+
+/// Reads a Meilisearch endpoint directly, for checks the endpoint's own
+/// consumer does not cover — index settings are not documents.
+async fn get(path: &str) -> serde_json::Value {
+    let response = reqwest::Client::new()
+        .get(format!("{URL}{path}"))
+        .header("Authorization", format!("Bearer {API_KEY}"))
+        .send()
+        .await
+        .expect("reach Meilisearch");
+    assert!(response.status().is_success(), "GET {path} failed");
+    let body = response.text().await.expect("a response body");
+    serde_json::from_str(&body).expect("a JSON response")
+}
+
+fn routed_document(id: u64, table: &str) -> CanonicalMessage {
+    let mut message = document(id, "x", None);
+    message
+        .metadata
+        .insert("postgres.table".to_owned(), table.to_owned());
+    message
+}
+
+/// The multi-table case: one CDC stream, one sink, an index per source table,
+/// each created on first write because none of them is known at startup.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn a_templated_index_fans_one_batch_out_across_indexes() {
+    run_test_with_docker("tests/docker-compose.yml", || async {
+        let prefix = index_name("routed");
+        let movies = format!("{prefix}-movies");
+        let directors = format!("{prefix}-directors");
+
+        let publisher = factory()
+            .create_publisher(
+                "routed",
+                &config(
+                    &prefix,
+                    serde_json::json!({"index": "${metadata:postgres.table}"}),
+                ),
+            )
+            .await
+            .expect("create Meilisearch publisher");
+
+        let sent = publisher
+            .send_batch(vec![
+                routed_document(1, &movies),
+                routed_document(2, &movies),
+                routed_document(3, &directors),
+            ])
+            .await
+            .expect("send the routed batch");
+        assert!(matches!(sent, SentBatch::Ack), "{sent:?}");
+
+        for (index, expected) in [(&movies, vec![1, 2]), (&directors, vec![3])] {
+            let mut consumer = factory()
+                .create_consumer(index, &config(index, serde_json::json!({})))
+                .await
+                .expect("create Meilisearch consumer");
+            assert_eq!(ids(&read_all(consumer.as_mut()).await), expected);
+            assert_eq!(
+                get(&format!("/indexes/{index}")).await["primaryKey"],
+                serde_json::json!("id"),
+                "a routed index should be created with the configured primary key"
+            );
+        }
+    })
+    .await;
+}
+
+/// `mqb copy` can stand an index up from nothing: the settings a search needs
+/// are part of the endpoint's configuration, not a separate provisioning step.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn settings_are_applied_to_the_index_before_documents_arrive() {
+    run_test_with_docker("tests/docker-compose.yml", || async {
+        let index = index_name("settings");
+        let publisher = factory()
+            .create_publisher(
+                &index,
+                &config(
+                    &index,
+                    serde_json::json!({
+                        "settings": {
+                            "searchableAttributes": ["title"],
+                            "filterableAttributes": ["title"],
+                        }
+                    }),
+                ),
+            )
+            .await
+            .expect("create Meilisearch publisher");
+
+        let settings = get(&format!("/indexes/{index}/settings")).await;
+        assert_eq!(
+            settings["searchableAttributes"],
+            serde_json::json!(["title"])
+        );
+        assert_eq!(
+            settings["filterableAttributes"],
+            serde_json::json!(["title"])
+        );
+        // A key the route never set keeps Meilisearch's own default, because
+        // `PATCH /settings` merges rather than replaces.
+        assert_eq!(settings["displayedAttributes"], serde_json::json!(["*"]));
+
+        publisher
+            .send_batch(vec![document(1, "one", None)])
+            .await
+            .expect("send a document");
+
+        // A setting Meilisearch does not know must stop the route, not be
+        // dropped in silence: the index would otherwise not match the config.
+        let rejected = index_name("bad-settings");
+        let outcome = factory()
+            .create_publisher(
+                &rejected,
+                &config(
+                    &rejected,
+                    serde_json::json!({"settings": {"notASetting": ["title"]}}),
+                ),
+            )
+            .await;
+        let Err(error) = outcome else {
+            panic!("an unknown setting should fail the route");
+        };
+        assert!(
+            format!("{error:#}").contains("prepare Meilisearch index"),
+            "{error:#}"
+        );
+    })
+    .await;
+}
+
+/// A batch larger than one request must still arrive whole, in order, rather
+/// than being dead-lettered as `payload_too_large`.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn a_batch_over_the_request_limit_is_split_and_still_lands_complete() {
+    run_test_with_docker("tests/docker-compose.yml", || async {
+        let index = index_name("chunked");
+        let publisher = factory()
+            .create_publisher(
+                &index,
+                &config(&index, serde_json::json!({"max_request_bytes": 64})),
+            )
+            .await
+            .expect("create Meilisearch publisher");
+
+        let documents: Vec<_> = (1..=10).map(|id| document(id, "title", None)).collect();
+        let sent = publisher
+            .send_batch(documents)
+            .await
+            .expect("send the oversized batch");
+        assert!(matches!(sent, SentBatch::Ack), "{sent:?}");
+
+        let mut consumer = factory()
+            .create_consumer(&index, &config(&index, serde_json::json!({})))
+            .await
+            .expect("create Meilisearch consumer");
+        assert_eq!(
+            ids(&read_all(consumer.as_mut()).await),
+            (1..=10).collect::<Vec<_>>()
+        );
+    })
+    .await;
+}

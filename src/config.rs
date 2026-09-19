@@ -118,6 +118,13 @@ fn default_task_timeout_ms() -> u64 {
     60_000
 }
 
+/// Meilisearch refuses a request body over `MEILI_HTTP_PAYLOAD_SIZE_LIMIT`,
+/// 100 MB out of the box. Splitting below that keeps the headroom a proxy or a
+/// hosted instance with a lower cap usually needs.
+fn default_max_request_bytes() -> u64 {
+    90_000_000
+}
+
 fn default_polling_interval_ms() -> u64 {
     1_000
 }
@@ -132,7 +139,9 @@ pub struct MeilisearchConfig {
     /// instance started without a master key.
     #[serde(default)]
     pub api_key: Option<String>,
-    /// Index UID; defaults to the route name.
+    /// Index UID; defaults to the route name. Output only, this may be a
+    /// template such as `${metadata:postgres.table}`, which routes each message
+    /// to the index its own metadata names.
     #[serde(default)]
     pub index: Option<String>,
     /// The document field Meilisearch keys documents by. Strongly recommended:
@@ -143,6 +152,13 @@ pub struct MeilisearchConfig {
     /// Output only: whether an upsert replaces or merges. See [`WriteMethod`].
     #[serde(default)]
     pub method: WriteMethod,
+    /// Output only: index settings forwarded verbatim to
+    /// `PATCH /indexes/{uid}/settings` when the index is created, e.g.
+    /// `searchableAttributes` or `filterableAttributes`. The call merges only
+    /// the keys it is given, so settings this endpoint does not set are left
+    /// as they are.
+    #[serde(default)]
+    pub settings: Option<serde_json::Map<String, serde_json::Value>>,
     /// Output only: a template resolving to the change operation of a message,
     /// typically `${metadata:postgres.operation}`. Unset means every message is
     /// an upsert, which is all a plain table copy needs.
@@ -169,6 +185,14 @@ pub struct MeilisearchConfig {
         deserialize_with = "flexible::integer"
     )]
     pub task_timeout_ms: u64,
+    /// Output only: the largest document request this endpoint will send. A run
+    /// bigger than this is split into several requests, still in order, rather
+    /// than rejected whole as `payload_too_large`.
+    #[serde(
+        default = "default_max_request_bytes",
+        deserialize_with = "flexible::integer"
+    )]
+    pub max_request_bytes: u64,
     #[serde(default, deserialize_with = "flexible::optional_integer")]
     pub connect_timeout_ms: Option<u64>,
     #[serde(default, deserialize_with = "flexible::optional_integer")]
@@ -215,6 +239,12 @@ fn normalize_url(url: &str) -> String {
     url.to_owned()
 }
 
+/// Whether a value carries a `${...}` token, which makes it per-message. Only
+/// the publisher can honour that; a reader pages through one concrete index.
+pub(crate) fn is_template(value: &str) -> bool {
+    value.contains("${")
+}
+
 /// A rejected configuration cannot heal by reconnecting, so both constructors
 /// below hand the route an error classified as permanent. An unclassified
 /// `anyhow::Error` reaches the route as a connection failure, which it retries
@@ -223,7 +253,17 @@ pub(crate) fn resolve_for_consumer(
     route_name: &str,
     value: &serde_json::Value,
 ) -> anyhow::Result<(MeilisearchConfig, String)> {
-    resolve(route_name, value).map_err(|error| anyhow::Error::new(ConsumerError::Permanent(error)))
+    resolve(route_name, value)
+        .and_then(|(config, index)| {
+            if is_template(&index) {
+                Err(anyhow!(
+                    "Meilisearch `index` cannot be a template when reading: a reader pages through one index, so '{index}' has nothing to resolve against"
+                ))
+            } else {
+                Ok((config, index))
+            }
+        })
+        .map_err(|error| anyhow::Error::new(ConsumerError::Permanent(error)))
 }
 
 pub(crate) fn resolve_for_publisher(
@@ -256,6 +296,11 @@ fn resolve(
     if config.operation.is_some() && config.primary_key.is_none() {
         return Err(anyhow!(
             "Meilisearch `primary_key` is required when `operation` is set, so a delete can name the document to remove"
+        ));
+    }
+    if config.max_request_bytes == 0 {
+        return Err(anyhow!(
+            "Meilisearch `max_request_bytes` must be greater than 0"
         ));
     }
     if config.task_timeout_ms == 0 {
@@ -396,6 +441,69 @@ mod tests {
             &value(serde_json::json!({"task_timeout_ms": "soon"}))
         )
         .is_err());
+    }
+
+    #[test]
+    fn settings_are_carried_through_untouched() {
+        let (config, _) = resolve(
+            "route",
+            &value(serde_json::json!({
+                "settings": {
+                    "searchableAttributes": ["title", "overview"],
+                    "filterableAttributes": ["genre"],
+                    "pagination": {"maxTotalHits": 10000},
+                }
+            })),
+        )
+        .unwrap();
+
+        let settings = config.settings.expect("settings should be kept");
+        assert_eq!(settings.len(), 3);
+        assert_eq!(
+            settings["searchableAttributes"],
+            serde_json::json!(["title", "overview"])
+        );
+        assert_eq!(settings["pagination"]["maxTotalHits"], 10_000);
+    }
+
+    #[test]
+    fn a_request_size_limit_defaults_below_meilisearchs_own() {
+        let (config, _) = resolve("route", &value(serde_json::json!({}))).unwrap();
+        assert_eq!(config.max_request_bytes, 90_000_000);
+
+        let (tuned, _) = resolve(
+            "route",
+            &value(serde_json::json!({"max_request_bytes": "1048576"})),
+        )
+        .unwrap();
+        assert_eq!(tuned.max_request_bytes, 1_048_576);
+
+        assert!(resolve("route", &value(serde_json::json!({"max_request_bytes": 0}))).is_err());
+    }
+
+    /// A sink can fan one stream across indexes; a reader pages through exactly
+    /// one, so the same template has nothing to resolve against there.
+    #[test]
+    fn a_templated_index_is_a_sink_only_feature() {
+        let routed = value(serde_json::json!({"index": "${metadata:postgres.table}"}));
+
+        let (_, index) = resolve_for_publisher("route", &routed).unwrap();
+        assert_eq!(index, "${metadata:postgres.table}");
+
+        let error = resolve_for_consumer("route", &routed).unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<ConsumerError>(),
+            Some(ConsumerError::Permanent(_))
+        ));
+        assert!(format!("{error:#}").contains("cannot be a template"));
+    }
+
+    #[test]
+    fn a_token_anywhere_in_the_value_makes_it_a_template() {
+        assert!(is_template("${metadata:postgres.table}"));
+        assert!(is_template("app_${metadata:postgres.table}"));
+        assert!(!is_template("movies"));
+        assert!(!is_template(""));
     }
 
     #[test]

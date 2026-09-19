@@ -182,6 +182,26 @@ impl MeiliClient {
         }
     }
 
+    /// Forwards a settings document to `PATCH /indexes/{uid}/settings`, which
+    /// merges only the keys it is given. The body is passed through verbatim,
+    /// so a setting Meilisearch adds later needs no change here — and an
+    /// unknown one is rejected by Meilisearch rather than silently dropped.
+    pub(crate) async fn update_settings(
+        &self,
+        index: &str,
+        settings: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<(), MeiliError> {
+        let request = self
+            .request(
+                reqwest::Method::PATCH,
+                &format!("/indexes/{index}/settings"),
+            )
+            .header("Content-Type", "application/json")
+            .body(serde_json::to_vec(settings).unwrap_or_default());
+        let task = self.send_for_task(request).await?;
+        self.wait_for_task(task).await
+    }
+
     /// Sends one NDJSON body of documents, returning the task it enqueued.
     pub(crate) async fn add_documents(
         &self,
