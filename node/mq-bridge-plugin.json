@@ -1,0 +1,4 @@
+{
+  "name": "meilisearch",
+  "library": "mq_bridge_meilisearch"
+}

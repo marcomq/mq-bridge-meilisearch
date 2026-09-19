@@ -1,0 +1,14 @@
+/target
+Cargo.lock
+__pycache__/
+*.py[cod]
+.serena
+.tokensave
+node/prebuilds/
+node/node_modules/
+python/dist/
+python/build/
+python/*.egg-info/
+python/mq_bridge_meilisearch/*.so
+python/mq_bridge_meilisearch/*.dylib
+python/mq_bridge_meilisearch/*.dll

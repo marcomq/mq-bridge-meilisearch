@@ -1,0 +1,317 @@
+name: Release packages
+
+on:
+  push:
+    tags:
+      - "[0-9]*"
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_HTTP_MULTIPLEXING: "false"
+  CARGO_NET_RETRY: "5"
+
+jobs:
+  verify-version:
+    name: Verify release version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Match package versions to tag
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python scripts/set_version.py --check
+          python - <<'PY'
+          import os
+          import tomllib
+          from pathlib import Path
+
+          expected = os.environ["RELEASE_TAG"].removeprefix("v")
+          actual = tomllib.loads(Path("Cargo.toml").read_text())["package"]["version"]
+          if actual != expected:
+              raise SystemExit(
+                  f"tag version {expected!r} does not match Cargo.toml {actual!r}"
+              )
+          print(f"releasing {expected}")
+          PY
+
+  build-native-packages:
+    name: Build npm and Python (${{ matrix.platform }})
+    needs: verify-version
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            platform: linux-x64-gnu
+          - runner: ubuntu-24.04-arm
+            platform: linux-arm64-gnu
+          - runner: macos-15-intel
+            platform: darwin-x64
+          - runner: macos-latest
+            platform: darwin-arm64
+          - runner: windows-latest
+            platform: win32-x64-msvc
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install official mq-bridge packagers
+        shell: bash
+        working-directory: node
+        run: |
+          npm install --no-package-lock
+          python -m pip install "mq-bridge-py[plugin-packaging]==0.4.12"
+
+      - name: Stage npm native library
+        shell: bash
+        working-directory: node
+        run: npx mq-bridge-package-plugin --root .. --package node
+
+      - name: Build Python wheel
+        shell: bash
+        run: python -m mq_bridge.plugin_packaging --package python/mq_bridge_meilisearch --out python/dist
+
+      - name: Retag macOS wheel
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          WHEEL_PLATFORM_TAG: ${{ matrix.platform == 'darwin-arm64' && 'macosx_11_0_arm64' || 'macosx_10_9_x86_64' }}
+        run: |
+          # The packager tags every macOS wheel universal2, so both macOS builds
+          # would emit the same filename for a single-architecture library.
+          python -m pip install "wheel>=0.45"
+          python -m wheel tags --platform-tag "$WHEEL_PLATFORM_TAG" --remove python/dist/*.whl
+
+      - name: Repair Linux wheel
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          python -m pip install auditwheel patchelf
+          patchelf --version
+          python -m auditwheel repair python/dist/*.whl --wheel-dir python/repaired
+          rm python/dist/*.whl
+          mv python/repaired/*.whl python/dist/
+
+      - name: Build standalone plugin archive
+        shell: bash
+        env:
+          PLUGIN_PLATFORM: ${{ matrix.platform }}
+        run: |
+          python - <<'PY'
+          import os
+          import shutil
+          from pathlib import Path
+
+          platform = os.environ["PLUGIN_PLATFORM"]
+          libraries = [
+              path
+              for path in Path("node/prebuilds").rglob("*")
+              if path.suffix in {".so", ".dylib", ".dll"}
+          ]
+          if len(libraries) != 1:
+              raise SystemExit(f"expected one staged plugin library, found {libraries}")
+
+          staging = Path("release-dist/staging")
+          staging.mkdir(parents=True)
+          shutil.copy2(libraries[0], staging / libraries[0].name)
+          shutil.copy2("node/mq-bridge-plugin.json", staging / "mq-bridge-plugin.json")
+
+          base = Path("release-dist") / f"mq-bridge-meilisearch-{platform}"
+          archive_format = "zip" if platform.startswith("win32-") else "gztar"
+          shutil.make_archive(str(base), archive_format, staging)
+          PY
+
+      - name: Upload standalone plugin archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: standalone-${{ matrix.platform }}
+          path: release-dist/mq-bridge-meilisearch-*
+          if-no-files-found: error
+
+      - name: Upload npm native library
+        uses: actions/upload-artifact@v4
+        with:
+          name: npm-${{ matrix.platform }}
+          path: node/prebuilds
+          if-no-files-found: error
+
+      - name: Upload Python wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-${{ matrix.platform }}
+          path: python/dist/*.whl
+          if-no-files-found: error
+
+  publish-crate:
+    name: Publish crate
+    needs: build-native-packages
+    runs-on: ubuntu-latest
+    environment: crates-io
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+
+      - name: Verify crate package
+        run: cargo package
+
+      - name: Authenticate to crates.io
+        id: auth
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18
+
+      - name: Publish crate
+        run: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+      - name: Upload crate archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: crate-package
+          path: target/package/*.crate
+          if-no-files-found: error
+
+  publish-npm:
+    name: Publish npm package
+    needs: build-native-packages
+    runs-on: ubuntu-latest
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: https://registry.npmjs.org
+
+      - name: Install npm with trusted publishing support
+        run: npm install --global npm@11.5.1
+
+      - name: Download native libraries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: npm-*
+          path: node/prebuilds
+          merge-multiple: true
+
+      - name: Create npm tarball
+        working-directory: node
+        run: mkdir -p ../dist && npm pack --pack-destination ../dist
+
+      - name: Publish to npm
+        env:
+          NPM_CONFIG_PROVENANCE: "true"
+        run: npm publish ./dist/*.tgz --access public
+
+      - name: Upload npm tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: npm-tarball
+          path: dist/*.tgz
+          if-no-files-found: error
+
+  publish-pypi:
+    name: Publish Python wheels
+    needs: build-native-packages
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Download wheels
+        uses: actions/download-artifact@v4
+        with:
+          pattern: python-*
+          path: dist
+          merge-multiple: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Validate wheels
+        run: |
+          python -m pip install twine
+          ls -1 dist/
+          twine check dist/*
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
+
+  github-release:
+    name: Create GitHub release
+    needs: [publish-crate, publish-npm, publish-pypi]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download standalone plugin archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: standalone-*
+          path: artifacts/plugins
+          merge-multiple: true
+
+      - name: Download npm tarball
+        uses: actions/download-artifact@v4
+        with:
+          name: npm-tarball
+          path: artifacts/npm
+
+      - name: Download Python wheels
+        uses: actions/download-artifact@v4
+        with:
+          pattern: python-*
+          path: artifacts/python
+          merge-multiple: true
+
+      - name: Download crate archive
+        uses: actions/download-artifact@v4
+        with:
+          name: crate-package
+          path: artifacts/crate
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: artifacts/**/*

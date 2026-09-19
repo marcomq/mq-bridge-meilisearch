@@ -1,0 +1,19 @@
+routes:
+  file_to_meilisearch:
+    batch_size: 1000
+    exit_on_empty: true
+    input:
+      file:
+        path: "examples/movies.jsonl"
+        format: raw
+    output:
+      custom:
+        name: meilisearch
+        config:
+          url: "http://localhost:7700"
+          # Matches tests/docker-compose.yml; drop it for an instance
+          # started without a master key.
+          api_key: "mq-bridge-test-key"
+          # index defaults to "file_to_meilisearch" when omitted.
+          index: "movies"
+          primary_key: "id"
