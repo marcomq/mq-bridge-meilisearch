@@ -1,6 +1,6 @@
 {
   "name": "mq-bridge-meilisearch",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Meilisearch endpoint for mq-bridge, shipped as a native plugin",
   "license": "MIT OR Apache-2.0",
   "main": "index.js",
@@ -39,9 +39,9 @@
     "node": ">=18"
   },
   "peerDependencies": {
-    "mq-bridge": ">=0.4.11 <0.5.0"
+    "mq-bridge": ">=0.4.13"
   },
   "devDependencies": {
-    "mq-bridge": "0.4.11"
+    "mq-bridge": "0.4.13"
   }
 }

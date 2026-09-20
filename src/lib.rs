@@ -49,6 +49,10 @@ pub fn register() -> anyhow::Result<()> {
 
 #[async_trait]
 impl CustomEndpointFactory for MeilisearchFactory {
+    fn config_schema(&self) -> Option<serde_json::Value> {
+        config::config_schema()
+    }
+
     async fn create_consumer(
         &self,
         route_name: &str,

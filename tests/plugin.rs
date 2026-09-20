@@ -19,7 +19,8 @@ use mq_bridge::{
     traits::{CustomEndpointFactory, MessageConsumer, MessageDisposition},
     CanonicalMessage,
 };
-use mq_bridge_meilisearch::MeilisearchFactory;
+use mq_bridge_meilisearch::{MeilisearchConfig, MeilisearchFactory};
+use serde_json::json;
 
 const URL: &str = "http://localhost:7700";
 const API_KEY: &str = "mq-bridge-test-key";
@@ -190,6 +191,35 @@ async fn suite(
         "a_nacked_batch_is_read_again",
         "documents_carry_locating_metadata",
     ])
+}
+
+/// What the declared schema buys: a query string carries no types, so without
+/// one `wait_for_task=false` would reach the endpoint as the string `"false"`.
+/// The host coerces against the schema, so the endpoint's own types are what
+/// arrive — which is why the endpoint takes those and nothing else.
+#[test]
+fn a_uri_maps_onto_the_declared_schema() {
+    mq_bridge_meilisearch::register().expect("register the endpoint");
+
+    let config = mq_bridge::plugin::endpoint_uri_schema("meilisearch")
+        .config_from_uri(
+            "meilisearch://localhost:7700?index=movies&wait_for_task=false\
+             &task_timeout_ms=30000&delete_values=delete,remove&method=update",
+        )
+        .expect("map the uri");
+
+    assert_eq!(config["url"], json!("meilisearch://localhost:7700"));
+    assert_eq!(config["index"], json!("movies"));
+    assert_eq!(config["wait_for_task"], json!(false));
+    assert_eq!(config["task_timeout_ms"], json!(30000));
+    assert_eq!(config["delete_values"], json!(["delete", "remove"]));
+    assert_eq!(config["method"], json!("update"));
+
+    // And the endpoint accepts what the mapping produced: a schema that maps a
+    // URI the endpoint then rejects would be worth nothing, and this config
+    // denies unknown fields.
+    serde_json::from_value::<MeilisearchConfig>(serde_json::Value::Object(config))
+        .expect("the mapped configuration deserializes");
 }
 
 #[tokio::test(flavor = "multi_thread")]

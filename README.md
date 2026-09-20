@@ -163,9 +163,11 @@ Both halves are keyed by `primary_key` and therefore idempotent, so the replay
 corrects anything the copy applied stale. Watch the slot's lag while step 2
 runs: an unread slot retains WAL.
 
-A URI query carries no types, so every option arrives as a string;
-`create_index=false`, `task_timeout_ms=30000` and `delete_values=delete,remove`
-are all accepted. YAML keeps using typed forms.
+A URI query carries no types, so the host maps one against the schema this
+endpoint declares: `create_index=false`, `task_timeout_ms=30000` and
+`delete_values=delete,remove` reach the endpoint as a boolean, a number and a
+list. That mapping is ABI 1.1, so addressing this endpoint by URI needs
+mq-bridge 0.4.13 or newer. YAML routes are unaffected, having types already.
 
 ### On Supabase
 

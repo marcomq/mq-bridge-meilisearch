@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Context};
 use mq_bridge::errors::{ConsumerError, PublisherError};
+use schemars::JsonSchema;
 use serde::Deserialize;
 
 /// How an upsert reaches Meilisearch.
@@ -17,92 +18,22 @@ pub enum WriteMethod {
 }
 
 impl WriteMethod {
+    const ALL: [Self; 2] = [Self::Replace, Self::Update];
+
+    /// The spelling `rename_all = "lowercase"` gives each variant. Exhaustive,
+    /// so a new variant cannot reach the schema unnamed.
+    fn as_str(self) -> &'static str {
+        match self {
+            WriteMethod::Replace => "replace",
+            WriteMethod::Update => "update",
+        }
+    }
+
     pub(crate) fn http_method(self) -> reqwest::Method {
         match self {
             WriteMethod::Replace => reqwest::Method::POST,
             WriteMethod::Update => reqwest::Method::PUT,
         }
-    }
-}
-
-/// Every value in a CLI endpoint URI arrives as a string — a query string
-/// carries no types — so the scalar options accept both their real JSON form
-/// and its spelling. A YAML route is unaffected; it already has types.
-mod flexible {
-    use serde::{de::Error, Deserialize, Deserializer};
-
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum BoolOrText {
-        Bool(bool),
-        Text(String),
-    }
-
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum IntOrText {
-        Int(u64),
-        Text(String),
-    }
-
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum ListOrText {
-        List(Vec<String>),
-        Text(String),
-    }
-
-    fn parse_bool<E: Error>(text: &str) -> Result<bool, E> {
-        match text.trim().to_ascii_lowercase().as_str() {
-            "true" => Ok(true),
-            "false" => Ok(false),
-            _ => Err(E::custom(format!("expected true or false, found '{text}'"))),
-        }
-    }
-
-    fn parse_int<E: Error>(text: &str) -> Result<u64, E> {
-        text.trim()
-            .parse()
-            .map_err(|_| E::custom(format!("expected a whole number, found '{text}'")))
-    }
-
-    pub(super) fn boolean<'de, D: Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
-        match BoolOrText::deserialize(deserializer)? {
-            BoolOrText::Bool(value) => Ok(value),
-            BoolOrText::Text(text) => parse_bool(&text),
-        }
-    }
-
-    pub(super) fn integer<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
-        match IntOrText::deserialize(deserializer)? {
-            IntOrText::Int(value) => Ok(value),
-            IntOrText::Text(text) => parse_int(&text),
-        }
-    }
-
-    pub(super) fn optional_integer<'de, D: Deserializer<'de>>(
-        deserializer: D,
-    ) -> Result<Option<u64>, D::Error> {
-        match Option::<IntOrText>::deserialize(deserializer)? {
-            None => Ok(None),
-            Some(IntOrText::Int(value)) => Ok(Some(value)),
-            Some(IntOrText::Text(text)) => parse_int(&text).map(Some),
-        }
-    }
-
-    /// A list, or the comma-separated spelling a URI can carry.
-    pub(super) fn string_list<'de, D: Deserializer<'de>>(
-        deserializer: D,
-    ) -> Result<Vec<String>, D::Error> {
-        Ok(match ListOrText::deserialize(deserializer)? {
-            ListOrText::List(values) => values,
-            ListOrText::Text(text) => text
-                .split(',')
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_owned)
-                .collect(),
-        })
     }
 }
 
@@ -130,10 +61,15 @@ fn default_polling_interval_ms() -> u64 {
 }
 
 /// Configuration accepted by an endpoint named `meilisearch`.
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct MeilisearchConfig {
     /// Base URL of the Meilisearch instance, e.g. `http://localhost:7700`.
+    ///
+    /// Takes the address of a `meilisearch://host:7700/prefix?index=…` URI —
+    /// everything before the query — so a path prefix survives and `index` stays
+    /// a query parameter rather than competing with it.
+    #[schemars(extend("x-mqb-uri" = "url"))]
     pub url: String,
     /// A master key or an API key with access to the index. Omit for an
     /// instance started without a master key.
@@ -151,6 +87,7 @@ pub struct MeilisearchConfig {
     pub primary_key: Option<String>,
     /// Output only: whether an upsert replaces or merges. See [`WriteMethod`].
     #[serde(default)]
+    #[schemars(schema_with = "write_method_schema")]
     pub method: WriteMethod,
     /// Output only: index settings forwarded verbatim to
     /// `PATCH /indexes/{uid}/settings` when the index is created, e.g.
@@ -165,37 +102,28 @@ pub struct MeilisearchConfig {
     #[serde(default)]
     pub operation: Option<String>,
     /// Output only: operation values that mean "remove this document".
-    #[serde(
-        default = "default_delete_values",
-        deserialize_with = "flexible::string_list"
-    )]
+    #[serde(default = "default_delete_values")]
     pub delete_values: Vec<String>,
     /// Create the index at startup if it does not exist, so `primary_key` is
     /// applied before the first document rather than inferred from it.
-    #[serde(default = "default_true", deserialize_with = "flexible::boolean")]
+    #[serde(default = "default_true")]
     pub create_index: bool,
     /// Output only: wait for the asynchronous task each write enqueues to
     /// finish before acknowledging. Turning this off acknowledges on enqueue,
     /// which commits the source cursor for writes that may still fail.
-    #[serde(default = "default_true", deserialize_with = "flexible::boolean")]
+    #[serde(default = "default_true")]
     pub wait_for_task: bool,
     /// How long to wait for one enqueued task, in milliseconds.
-    #[serde(
-        default = "default_task_timeout_ms",
-        deserialize_with = "flexible::integer"
-    )]
+    #[serde(default = "default_task_timeout_ms")]
     pub task_timeout_ms: u64,
     /// Output only: the largest document request this endpoint will send. A run
     /// bigger than this is split into several requests, still in order, rather
     /// than rejected whole as `payload_too_large`.
-    #[serde(
-        default = "default_max_request_bytes",
-        deserialize_with = "flexible::integer"
-    )]
+    #[serde(default = "default_max_request_bytes")]
     pub max_request_bytes: u64,
-    #[serde(default, deserialize_with = "flexible::optional_integer")]
+    #[serde(default)]
     pub connect_timeout_ms: Option<u64>,
-    #[serde(default, deserialize_with = "flexible::optional_integer")]
+    #[serde(default)]
     pub request_timeout_ms: Option<u64>,
     /// Input only: comma-separated document fields to return; all by default.
     #[serde(default)]
@@ -209,15 +137,30 @@ pub struct MeilisearchConfig {
     #[serde(default)]
     pub checkpoint_store: Option<String>,
     /// Input only: delay between polls once the scan has reached the end.
-    #[serde(
-        default = "default_polling_interval_ms",
-        deserialize_with = "flexible::integer"
-    )]
+    #[serde(default = "default_polling_interval_ms")]
     pub polling_interval_ms: u64,
     /// Input only: upper bound the idle delay backs off to; no backoff by
     /// default, so the reader keeps polling at `polling_interval_ms`.
-    #[serde(default, deserialize_with = "flexible::optional_integer")]
+    #[serde(default)]
     pub max_polling_interval_ms: Option<u64>,
+}
+
+/// `method` as a flat `enum`, rather than the `$ref` to a `oneOf` of `const`s
+/// a derived schema spells a documented enum as. A host resolves neither, so
+/// the derived form leaves the field unchecked.
+fn write_method_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": "string",
+        "enum": WriteMethod::ALL.map(WriteMethod::as_str),
+    })
+}
+
+/// What this endpoint accepts, as the JSON Schema a host reads to render a form
+/// for it and to turn a URI's query string into typed configuration.
+///
+/// Derived rather than written out, so it cannot drift from the struct.
+pub(crate) fn config_schema() -> Option<serde_json::Value> {
+    serde_json::to_value(schemars::schema_for!(MeilisearchConfig)).ok()
 }
 
 /// Rewrites a `meilisearch://` URL to the HTTP one Meilisearch actually speaks.
@@ -395,52 +338,56 @@ mod tests {
         assert_eq!(config.url, "http://localhost:7700");
     }
 
-    /// A URI query carries no types, so every option arrives as a string.
+    /// The declared schema is the endpoint's only contract: a host maps a URI
+    /// against it and hands over typed values, so the endpoint takes those and
+    /// nothing else.
     #[test]
-    fn scalar_options_accept_the_string_spelling_a_uri_carries() {
+    fn the_typed_forms_are_what_the_endpoint_takes() {
         let (config, _) = resolve(
             "route",
             &value(serde_json::json!({
-                "create_index": "false",
-                "wait_for_task": "TRUE",
-                "task_timeout_ms": "30000",
-                "connect_timeout_ms": "250",
-                "delete_values": "delete, remove",
+                "create_index": false,
+                "task_timeout_ms": 30000,
+                "connect_timeout_ms": 250,
+                "delete_values": ["delete", "remove"],
             })),
         )
         .unwrap();
-
         assert!(!config.create_index);
-        assert!(config.wait_for_task);
         assert_eq!(config.task_timeout_ms, 30_000);
         assert_eq!(config.connect_timeout_ms, Some(250));
         assert_eq!(
             config.delete_values,
             vec!["delete".to_owned(), "remove".to_owned()]
         );
+
+        for spelled_as_text in [
+            serde_json::json!({"create_index": "false"}),
+            serde_json::json!({"task_timeout_ms": "30000"}),
+            serde_json::json!({"delete_values": "delete,remove"}),
+            serde_json::json!({"create_index": "yes"}),
+        ] {
+            assert!(resolve("route", &value(spelled_as_text)).is_err());
+        }
     }
 
+    /// A `$ref` to a `oneOf` of `const`s is not something a host checks, so the
+    /// schema names the variants inline — and names all of them.
     #[test]
-    fn the_typed_forms_still_work_and_nonsense_is_still_rejected() {
-        let (config, _) = resolve(
-            "route",
-            &value(serde_json::json!({
-                "create_index": false,
-                "task_timeout_ms": 30000,
-                "delete_values": ["delete"],
-            })),
-        )
-        .unwrap();
-        assert!(!config.create_index);
-        assert_eq!(config.task_timeout_ms, 30_000);
-        assert_eq!(config.delete_values, vec!["delete".to_owned()]);
+    fn the_declared_method_enum_names_every_variant() {
+        let schema = config_schema().expect("a schema");
+        let method = &schema["properties"]["method"];
+        assert_eq!(method["type"], serde_json::json!("string"));
+        assert!(method.get("$ref").is_none());
 
-        assert!(resolve("route", &value(serde_json::json!({"create_index": "yes"}))).is_err());
-        assert!(resolve(
-            "route",
-            &value(serde_json::json!({"task_timeout_ms": "soon"}))
-        )
-        .is_err());
+        let declared = method["enum"].as_array().expect("an enum");
+        assert_eq!(declared.len(), WriteMethod::ALL.len());
+        for (value, variant) in declared.iter().zip(WriteMethod::ALL) {
+            assert_eq!(
+                serde_json::from_value::<WriteMethod>(value.clone()).unwrap(),
+                variant
+            );
+        }
     }
 
     #[test]
@@ -473,7 +420,7 @@ mod tests {
 
         let (tuned, _) = resolve(
             "route",
-            &value(serde_json::json!({"max_request_bytes": "1048576"})),
+            &value(serde_json::json!({"max_request_bytes": 1048576})),
         )
         .unwrap();
         assert_eq!(tuned.max_request_bytes, 1_048_576);

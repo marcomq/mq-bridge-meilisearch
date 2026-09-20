@@ -246,25 +246,24 @@ async fn a_task_that_fails_after_being_accepted_is_reported_not_acknowledged() {
 
 /// What `mqb copy … meilisearch://…` actually hands the endpoint.
 ///
-/// The CLI derives a plugin endpoint's `url` from the URI up to the query and
-/// makes every query parameter a string, so this config is built the same way
-/// rather than in its typed form. If this breaks, the CLI is broken.
+/// A host builds a plugin endpoint's configuration by mapping the URI against
+/// the schema the endpoint declares, so this runs that mapping rather than a
+/// hand-built imitation of it. If this breaks, the CLI is broken.
 #[tokio::test]
 #[ignore = "requires Docker"]
 async fn the_config_the_cli_builds_from_a_uri_works() {
     run_test_with_docker("tests/docker-compose.yml", || async {
         let factory = factory();
         let index = index_name("cli-uri");
-        // meilisearch://localhost:7700?index=…&primary_key=id&api_key=…&create_index=true
-        let config = serde_json::json!({
-            "url": "meilisearch://localhost:7700",
-            "index": index,
-            "primary_key": "id",
-            "api_key": API_KEY,
-            "create_index": "true",
-            "wait_for_task": "true",
-            "task_timeout_ms": "30000",
-        });
+        let config = serde_json::Value::Object(
+            mq_bridge::plugin::endpoint_uri_schema("meilisearch")
+                .config_from_uri(&format!(
+                    "meilisearch://localhost:7700?index={index}&primary_key=id\
+                     &api_key={API_KEY}&create_index=true&wait_for_task=true\
+                     &task_timeout_ms=30000"
+                ))
+                .expect("the URI should map onto the declared schema"),
+        );
 
         factory
             .create_publisher(&index, &config)
