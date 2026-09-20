@@ -227,6 +227,14 @@ mqb copy --plugin ./libmq_bridge_meilisearch.so 'file://movies.jsonl?format=raw'
 mq_bridge::plugin::load_endpoint_plugin("./libmq_bridge_meilisearch.so")?;
 ```
 
+A package manager puts the same library where mq-bridge already looks, so
+nothing has to name a path:
+
+```console
+brew install marcomq/tap/mq-bridge-meilisearch
+conda install -c marcomq mq-bridge-meilisearch
+```
+
 Python and Node.js users install a package that ships this library and hands its
 path to mq-bridge's generic loader; the configuration is identical in every
 language.

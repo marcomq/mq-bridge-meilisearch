@@ -12,3 +12,5 @@ python/*.egg-info/
 python/mq_bridge_meilisearch/*.so
 python/mq_bridge_meilisearch/*.dylib
 python/mq_bridge_meilisearch/*.dll
+/packaging/conda/stage/
+/packaging/conda/output/

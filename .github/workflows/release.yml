@@ -56,14 +56,19 @@ jobs:
         include:
           - runner: ubuntu-22.04
             platform: linux-x64-gnu
+            triple: x86_64-unknown-linux-gnu
           - runner: ubuntu-24.04-arm
             platform: linux-arm64-gnu
+            triple: aarch64-unknown-linux-gnu
           - runner: macos-15-intel
             platform: darwin-x64
+            triple: x86_64-apple-darwin
           - runner: macos-latest
             platform: darwin-arm64
+            triple: aarch64-apple-darwin
           - runner: windows-latest
             platform: win32-x64-msvc
+            triple: x86_64-pc-windows-msvc
     steps:
       - uses: actions/checkout@v4
         with:
@@ -120,14 +125,17 @@ jobs:
       - name: Build standalone plugin archive
         shell: bash
         env:
-          PLUGIN_PLATFORM: ${{ matrix.platform }}
+          PLUGIN_TRIPLE: ${{ matrix.triple }}
+          PLUGIN_VERSION: ${{ github.ref_name }}
         run: |
           python - <<'PY'
+          import hashlib
           import os
           import shutil
           from pathlib import Path
 
-          platform = os.environ["PLUGIN_PLATFORM"]
+          triple = os.environ["PLUGIN_TRIPLE"]
+          version = os.environ["PLUGIN_VERSION"].removeprefix("v")
           libraries = [
               path
               for path in Path("node/prebuilds").rglob("*")
@@ -140,10 +148,19 @@ jobs:
           staging.mkdir(parents=True)
           shutil.copy2(libraries[0], staging / libraries[0].name)
           shutil.copy2("node/mq-bridge-plugin.json", staging / "mq-bridge-plugin.json")
+          for name in ("LICENSE-MIT", "LICENSE-APACHE"):
+              shutil.copy2(name, staging / name)
 
-          base = Path("release-dist") / f"mq-bridge-meilisearch-{platform}"
-          archive_format = "zip" if platform.startswith("win32-") else "gztar"
-          shutil.make_archive(str(base), archive_format, staging)
+          # One archive shape on every platform — name, version, Rust target
+          # triple — and a checksum beside it. The Homebrew formula and the
+          # conda recipe are generated from these, and the sidecar is what
+          # spares the renderer from downloading every archive to hash it.
+          base = Path("release-dist") / f"mq-bridge-meilisearch-{version}-{triple}"
+          archive = Path(shutil.make_archive(str(base), "gztar", staging))
+          digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+          archive.with_name(archive.name + ".sha256").write_text(
+              f"{digest}  {archive.name}\n"
+          )
           PY
 
       - name: Upload standalone plugin archive
@@ -315,3 +332,87 @@ jobs:
         with:
           generate_release_notes: true
           files: artifacts/**/*
+
+  conda:
+    name: Conda ${{ matrix.target }} package
+    needs: github-release
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-64
+            runner: ubuntu-22.04
+            artifact: standalone-linux-x64-gnu
+          - target: linux-aarch64
+            runner: ubuntu-24.04-arm
+            artifact: standalone-linux-arm64-gnu
+          - target: osx-arm64
+            runner: macos-latest
+            artifact: standalone-darwin-arm64
+          - target: win-64
+            runner: windows-latest
+            artifact: standalone-win32-x64-msvc
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Download the standalone plugin archive
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: release-dist
+
+      # The recipe compiles nothing; it installs these files. Each package is
+      # therefore built on its own platform's runner, which keeps the recipe's
+      # `if: win` branches matching the host that runs them.
+      - name: Stage the library for the recipe
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p packaging/conda/stage
+          tar xzf release-dist/mq-bridge-meilisearch-*.tar.gz -C packaging/conda/stage
+          echo "MQ_BRIDGE_PLUGIN_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+
+      - name: Build the conda package
+        uses: prefix-dev/rattler-build-action@1ca5f45832f419a46d1326ccc5861d7e14d67c44 # v0.2.39
+        with:
+          recipe-path: packaging/conda/recipe.yaml
+          build-args: --target-platform=${{ matrix.target }} -c conda-forge
+          artifact-name: conda-${{ matrix.target }}
+
+  publish-conda:
+    name: Publish conda packages
+    needs: conda
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Download conda packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: conda-*
+          path: conda-packages
+          merge-multiple: true
+
+      # A missing token fails the job instead of warning: a release that
+      # quietly publishes nothing is the worse outcome.
+      - name: Upload to Anaconda.org
+        env:
+          ANACONDA_API_TOKEN: ${{ secrets.ANACONDA_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${ANACONDA_API_TOKEN}" ]; then
+            echo "::error::ANACONDA_API_TOKEN is not configured; nothing was published"
+            exit 1
+          fi
+          mapfile -t packages < <(find conda-packages -type f -name '*.conda' | sort)
+          if [ "${#packages[@]}" -eq 0 ]; then
+            echo "::error::no conda packages were produced"
+            exit 1
+          fi
+          pipx install --include-deps anaconda-client
+          anaconda upload --user marcomq --label main "${packages[@]}"
