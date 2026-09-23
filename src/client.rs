@@ -238,8 +238,8 @@ impl MeiliClient {
     /// and applies it afterwards, so a task that is still `enqueued` says
     /// nothing about whether the documents were accepted.
     pub(crate) async fn wait_for_task(&self, task: u64) -> Result<(), MeiliError> {
-        const FIRST_POLL: Duration = Duration::from_millis(20);
-        const MAX_POLL: Duration = Duration::from_millis(250);
+        const FIRST_POLL: Duration = Duration::from_millis(10);
+        const MAX_POLL: Duration = Duration::from_millis(50);
 
         let deadline = Instant::now() + self.task_timeout;
         let mut delay = FIRST_POLL;

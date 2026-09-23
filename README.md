@@ -113,18 +113,25 @@ startup instead of being dropped silently.
 
 ### Delivery
 
-A batch is split into contiguous runs sharing one operation and one index, and
-the runs are issued in order — reordering `insert(id=7)` and `delete(id=7)`
-would leave document 7 in the index for good. A failing run takes every later
-run with it, so the route never sees an unissued write reported as delivered. A
-run over `max_request_bytes` is split into several ordered requests rather than
-rejected as `payload_too_large`.
+A batch costs one request per operation and index: all its upserts to an index
+go out together, and so do its deletes. Only writes to the same document keep
+their order — reordering `insert(id=7)` and `delete(id=7)` would leave document
+7 in the index for good — so a document switching operation starts a new
+segment, and segments are issued in order. Without `primary_key` documents
+cannot be told apart, and every switch starts one. A failing request fails its
+messages and every later segment, so the route never sees an unconfirmed write
+reported as delivered. A request over `max_request_bytes` is split into several
+ordered ones rather than rejected as `payload_too_large`.
+
+Meilisearch fails a whole request for one bad document, so documents it would
+refuse — no `primary_key` field, an invalid id, a payload that is not a JSON
+object — are rejected on their own before sending.
 
 Meilisearch answers a write with `202 Accepted` and applies it afterwards, so
 `wait_for_task` polls the task to a finished state before acknowledging.
 Otherwise the source's replication slot advances past writes that can still fail
-(`missing_document_id`, `invalid_document_id`), losing rows silently. That is one
-round trip per batch — negligible at `batch_size: 1000`.
+(an invalid `_geo`, for one), losing rows silently. That is one round trip per
+batch — negligible at `batch_size: 1000`.
 
 ### Ordering and `concurrency`
 
@@ -134,8 +141,8 @@ so the route serialises its sends **at any `concurrency`** — linked as a crate
 or loaded as a plugin by mq-bridge 0.4.13 or newer (plugin ABI 1.1).
 
 ABI 1.1 also reports a failure per message, so a plugin-loaded sink behaves like
-a linked one: only the messages from the failed run on are retried or
-dead-lettered, and the runs already written are not sent again.
+a linked one: only the failed messages, and those behind them, are retried or
+dead-lettered, and the writes already confirmed are not sent again.
 
 ## Backfilling an existing table
 
@@ -155,7 +162,7 @@ routes:
         slot_name: "mqb_meili"
         consume: capture_all
         cursor_id: "movies_backfill"
-        checkpoint_store: "/var/lib/mq-bridge/movies-phase.json"
+        checkpoint_store: "file:///var/lib/mq-bridge/movies-phase.json"
     output:
       custom:
         name: meilisearch
@@ -176,7 +183,8 @@ routes:
   `primary_key`, so the replay corrects anything the scan wrote stale.
 - **`cursor_id` + `checkpoint_store` make it resumable.** A restart skips tables
   already scanned and continues the current one from its last key; without them
-  every restart scans again from the start.
+  every restart scans again from the start. Write the store as `file:///…`:
+  mq-bridge reads a plain path as a table name in the source database.
 - **The primary key must be a single column.** Otherwise spell the phases out
   as a `sequence`, below.
 - Watch the slot's lag while the scan runs: an unread slot retains WAL.
@@ -205,7 +213,7 @@ input:
           publication: "movies_pub"
           slot_name: "mqb_meili"
     cursor_id: "movies_backfill"
-    checkpoint_store: "/var/lib/mq-bridge/movies-phase.json"
+    checkpoint_store: "file:///var/lib/mq-bridge/movies-phase.json"
 ```
 
 The output is the same as above. Before the first phase reads anything, the
@@ -273,7 +281,8 @@ field (see [Limitations](#limitations)), so build it upstream.
 on the route that owns the document (`movies`) and leave it unset on the others:
 there a delete becomes an update carrying only the key (under the default
 replica identity), which changes nothing — the old rating stays until the next
-write. Routes are not ordered against each other, and `update` creates a
+write. Under `REPLICA IDENTITY FULL` the delete carries the whole old row, so it
+writes the old values back instead. Routes are not ordered against each other, and `update` creates a
 document that does not exist yet, so a `movie_stats` change landing after its
 movie was deleted leaves a stub document holding only those fields.
 
@@ -349,14 +358,17 @@ Version 0.1 passes its suite against a real Meilisearch but has no production
 mileage — run it beside whatever you have now before cutting over.
 
 - **Joins are by primary key only.** A foreign-key join has to be denormalised
-  upstream; see [Merging rows](#merging-rows-from-different-tables).
+  upstream; see [Merging rows](#merging-rows-from-different-tables). If your
+  documents are built from lookups across tables, a CDC tool with SQL
+  enrichment (such as Sequin) fits better than this sink.
 - **`update` merges top-level fields only**: `{"tags": ["a"]}` replaces the whole
   array. Meilisearch's function-based edit applies to a filtered document set
   rather than one document per message, so it does not fit this sink. Compute
   the value upstream.
 - **No replay log.** Recovering from a bad transform means re-running the
   backfill. Put a durable queue in front of the sink if you need better.
-- **`checkpoint_store` takes a file path only.** mq-bridge's SQL, Mongo and
+- **`checkpoint_store` takes a file only.** Write it as `file:///…`, the form
+  `postgres_cdc` needs too. mq-bridge's SQL, Mongo and
   object-store backends sit behind its own feature flags, which a plugin
   `cdylib` links with off.
 - **Per-message observability is thin.** A failed write reaches the route's

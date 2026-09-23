@@ -33,6 +33,16 @@ fn index_name(prefix: &str) -> String {
     format!("{prefix}-{}", uuid::Uuid::new_v4().simple())
 }
 
+/// Makes Meilisearch validate `_geo`, which it only does at indexing time: a
+/// document failing that check is accepted by the request and fails its task.
+fn geo_filterable() -> serde_json::Value {
+    serde_json::json!({"settings": {"filterableAttributes": ["_geo"]}})
+}
+
+fn bad_geo(id: u64) -> CanonicalMessage {
+    CanonicalMessage::from(serde_json::json!({"id": id, "_geo": "nowhere"}).to_string())
+}
+
 fn config(index: &str, extra: serde_json::Value) -> serde_json::Value {
     let mut config = serde_json::json!({
         "url": URL,
@@ -217,17 +227,14 @@ async fn a_task_that_fails_after_being_accepted_is_reported_not_acknowledged() {
     run_test_with_docker("tests/docker-compose.yml", || async {
         let factory = factory();
         let index = index_name("task-failure");
-        let config = config(&index, serde_json::json!({}));
+        let config = config(&index, geo_filterable());
 
         let publisher = factory
             .create_publisher(&index, &config)
             .await
             .expect("create Meilisearch publisher");
-        let without_primary_key =
-            CanonicalMessage::from(serde_json::json!({"title": "no id here"}).to_string());
-
         let sent = publisher
-            .send_batch(vec![without_primary_key])
+            .send_batch(vec![bad_geo(1)])
             .await
             .expect("the request itself is accepted");
 
@@ -240,6 +247,89 @@ async fn a_task_that_fails_after_being_accepted_is_reported_not_acknowledged() {
             "a document Meilisearch rejects cannot heal by retrying: {:?}",
             failed[0].1
         );
+    })
+    .await;
+}
+
+/// A failed run hands back its own messages and every later segment, even
+/// though those were already enqueued when the failure showed up; the other
+/// run of its segment, touching other documents, is acknowledged.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn a_failed_run_mid_batch_reports_it_and_every_later_segment() {
+    run_test_with_docker("tests/docker-compose.yml", || async {
+        let factory = factory();
+        let index = index_name("mid-failure");
+        let mut config = config(
+            &index,
+            serde_json::json!({"operation": "${metadata:postgres.operation}"}),
+        );
+        config["settings"] = geo_filterable()["settings"].clone();
+        let publisher = factory
+            .create_publisher(&index, &config)
+            .await
+            .expect("create Meilisearch publisher");
+
+        let mut invalid = bad_geo(5);
+        invalid
+            .metadata
+            .insert("postgres.operation".to_owned(), "insert".to_owned());
+        let batch = vec![
+            document(1, "one", Some("insert")),
+            invalid,
+            document(2, "two", Some("delete")),
+            document(1, "one", Some("delete")),
+        ];
+        let expected: Vec<_> = [0, 1, 3].iter().map(|&i| batch[i].message_id).collect();
+
+        let SentBatch::Partial { failed, .. } =
+            publisher.send_batch(batch).await.expect("send a batch")
+        else {
+            panic!("a batch with a failed run must not be acknowledged");
+        };
+        let failed: Vec<_> = failed.iter().map(|(m, _)| m.message_id).collect();
+        assert_eq!(failed, expected);
+    })
+    .await;
+}
+
+/// A CDC batch whose operations alternate between different documents costs
+/// one upsert and one delete task, not one task per switch.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn alternating_operations_on_distinct_documents_cost_two_tasks() {
+    run_test_with_docker("tests/docker-compose.yml", || async {
+        let factory = factory();
+        let index = index_name("pipelined");
+        let config = config(
+            &index,
+            serde_json::json!({"operation": "${metadata:postgres.operation}"}),
+        );
+        let publisher = factory
+            .create_publisher(&index, &config)
+            .await
+            .expect("create Meilisearch publisher");
+
+        let batch = (0..100)
+            .flat_map(|id| {
+                [
+                    document(id, "kept", Some("insert")),
+                    document(1000 + id, "gone", Some("delete")),
+                ]
+            })
+            .collect();
+        assert!(matches!(
+            publisher.send_batch(batch).await.expect("send a batch"),
+            SentBatch::Ack
+        ));
+
+        let tasks = get(&format!("/tasks?indexUids={index}&limit=1000")).await;
+        let tasks = tasks["results"].as_array().expect("a task list");
+        let writes: Vec<_> = tasks
+            .iter()
+            .filter(|task| task["type"] != "indexCreation")
+            .collect();
+        assert_eq!(writes.len(), 2, "one task per operation switch: {writes:?}");
     })
     .await;
 }
