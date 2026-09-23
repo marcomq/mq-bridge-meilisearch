@@ -90,7 +90,7 @@ jobs:
         working-directory: node
         run: |
           npm install --no-package-lock
-          python -m pip install "mq-bridge-py[plugin-packaging]==0.4.12"
+          python -m pip install "mq-bridge-py[plugin-packaging]==0.4.13"
 
       - name: Stage npm native library
         shell: bash

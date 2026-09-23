@@ -442,10 +442,8 @@ impl MessagePublisher for MeilisearchPublisher {
     }
 
     /// Meilisearch keys documents by primary key, so two batches touching one
-    /// document must reach it in source order. Honoured only when this crate is
-    /// linked directly: plugin ABI 1.0 carries no publisher-side ordering slot,
-    /// so a plugin-loaded route must be started at `concurrency` 1 — which the
-    /// mq-bridge CLI and MCP tools do not default to.
+    /// document must reach it in source order. A plugin host reads this through
+    /// the ABI 1.1 ordering slot.
     fn requires_ordered_publish(&self) -> bool {
         true
     }
@@ -555,6 +553,25 @@ mod tests {
     fn without_an_operation_mapping_every_message_is_an_upsert() {
         let publisher = publisher(None);
         let messages = vec![message(1, Some("delete")), message(2, None)];
+        let (runs, stopped) = publisher.plan(&messages);
+        assert!(stopped.is_none());
+        assert_eq!(
+            runs,
+            vec![Run {
+                op: Op::Upsert,
+                index: "movies".to_owned(),
+                start: 0,
+                end: 2
+            }]
+        );
+    }
+
+    /// A `capture_all` backfill row comes from a table scan and carries no
+    /// operation; it must still be indexed, not stopped or deleted.
+    #[test]
+    fn a_message_without_the_mapped_operation_is_an_upsert() {
+        let publisher = publisher(Some("${metadata:postgres.operation}"));
+        let messages = vec![message(1, None), message(2, Some("insert"))];
         let (runs, stopped) = publisher.plan(&messages);
         assert!(stopped.is_none());
         assert_eq!(

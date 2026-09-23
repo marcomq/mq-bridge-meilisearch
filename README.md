@@ -57,8 +57,9 @@ one, permanently.
 
 Values written `${metadata:<key>}` and `${payload:<field>}` are resolved per
 message, and may sit inside surrounding text (`app_${metadata:postgres.table}`).
-A message that leaves one unresolved is dead-lettered rather than written
-somewhere arbitrary.
+A message that leaves `index` unresolved is dead-lettered rather than written
+somewhere arbitrary. An unresolved `operation` counts as an upsert, which is
+what a backfilled row, carrying no operation, is.
 
 ## Streaming Postgres changes into an index
 
@@ -128,46 +129,91 @@ round trip per batch — negligible at `batch_size: 1000`.
 ### Ordering and `concurrency`
 
 Two batches touching one document must arrive in source order, or an older row
-overwrites a newer one silently. **Linked as a crate, you are safe at any
-`concurrency`**: the endpoint declares `requires_ordered_publish`.
+overwrites a newer one silently. The endpoint declares `requires_ordered_publish`,
+so the route serialises its sends **at any `concurrency`** — linked as a crate,
+or loaded as a plugin by mq-bridge 0.4.13 or newer (plugin ABI 1.1).
 
-**Loaded as a plugin, you are not** — plugin ABI 1.0 has no vtable slot for that
-flag, so the host publishes batches in parallel. Until an ABI carrying it ships,
-a plugin-loaded sink needs `concurrency: 1` wherever the default is higher
-(`mqb copy` and MCP `start_route` default to 4; a YAML route file defaults to 1).
-The input side is unaffected: `commit_requires_order` *is* an ABI entry.
+ABI 1.1 also reports a failure per message, so a plugin-loaded sink behaves like
+a linked one: only the messages from the failed run on are retried or
+dead-lettered, and the runs already written are not sent again.
 
 ## Backfilling an existing table
 
-CDC carries changes, not existing rows. Create the slot **before** the copy, or
-changes made during it are lost:
+CDC carries changes, not the rows already there. mq-bridge's `postgres_cdc`
+source reads those too with `consume: capture_all` (mq-bridge 0.4.13+): it
+creates the replication slot first, pages each table in the publication by its
+primary key, then streams from the slot — one route, no gap.
 
-```sql
-select pg_create_logical_replication_slot('mqb_meili', 'pgoutput');
-create publication movies_pub for table public.movies;
+```yaml
+routes:
+  movies_to_search:
+    batch_size: 1000
+    input:
+      postgres_cdc:
+        url: "postgres://user:pass@localhost/app"
+        publication: "movies_pub"
+        slot_name: "mqb_meili"
+        consume: capture_all
+        cursor_id: "movies_backfill"
+        checkpoint_store: "/var/lib/mq-bridge/movies-phase.json"
+    output:
+      custom:
+        name: meilisearch
+        config:
+          url: "http://localhost:7700"
+          api_key: "${MEILI_MASTER_KEY}"
+          index: "movies"
+          primary_key: "id"
+          operation: "${metadata:postgres.operation}"
 ```
 
-```console
-# 2. copy the rows that are already there
-mqb copy --drain --plugin ./libmq_bridge_meilisearch.so \
-  'postgres://user:pass@host:5432/app?table=public.movies' \
-  'meilisearch://localhost:7700?index=movies&primary_key=id&api_key=KEY'
+- **Use a literal `index`.** Backfilled rows are read by a table scan and carry
+  neither `postgres.operation` nor `postgres.table`. The missing operation makes
+  them upserts, as intended, but `${metadata:postgres.table}` cannot resolve and
+  would dead-letter them. Give each table its own publication and route.
+- **Delivery is at-least-once across the handover.** A row changed during the
+  scan is read twice, once by the scan and once from the slot. Both are keyed by
+  `primary_key`, so the replay corrects anything the scan wrote stale.
+- **`cursor_id` + `checkpoint_store` make it resumable.** A restart skips tables
+  already scanned and continues the current one from its last key; without them
+  every restart scans again from the start.
+- **The primary key must be a single column.** Otherwise spell the phases out
+  as a `sequence`, below.
+- Watch the slot's lag while the scan runs: an unread slot retains WAL.
 
-# 3. stream the changes the slot has been holding since step 1
-mqb copy --plugin ./libmq_bridge_meilisearch.so \
-  'postgres-cdc://user:pass@host:5432/app?publication=movies_pub&slot_name=mqb_meili' \
-  'meilisearch://localhost:7700?index=movies&primary_key=id&api_key=KEY&operation=${metadata:postgres.operation}'
+### Spelling the phases out: `sequence`
+
+`capture_all` is shorthand for mq-bridge's `sequence` input, which runs its
+inputs one after another in a single route: each is drained before the next
+starts, and the last one streams. Write it by hand when the shorthand does not
+fit — a composite or non-integer key (page by another unique, increasing
+column), only some of the publication's tables, or a backfill from somewhere
+else entirely, such as a JSONL export:
+
+```yaml
+input:
+  sequence:
+    endpoints:
+      - sqlx:
+          url: "postgres://user:pass@localhost/app"
+          table: "public.movies"
+          cursor_column: "movie_seq"
+          cursor_id: "movies_scan"
+          checkpoint_store: "file:///var/lib/mq-bridge/movies-scan.json"
+      - postgres_cdc:
+          url: "postgres://user:pass@localhost/app"
+          publication: "movies_pub"
+          slot_name: "mqb_meili"
+    cursor_id: "movies_backfill"
+    checkpoint_store: "/var/lib/mq-bridge/movies-phase.json"
 ```
 
-Both halves are keyed by `primary_key` and therefore idempotent, so the replay
-corrects anything the copy applied stale. Watch the slot's lag while step 2
-runs: an unread slot retains WAL.
-
-A URI query carries no types, so the host maps one against the schema this
-endpoint declares: `create_index=false`, `task_timeout_ms=30000` and
-`delete_values=delete,remove` reach the endpoint as a boolean, a number and a
-list. That mapping is ABI 1.1, so addressing this endpoint by URI needs
-mq-bridge 0.4.13 or newer. YAML routes are unaffected, having types already.
+The output is the same as above. Before the first phase reads anything, the
+`postgres_cdc` phase creates its slot, so the handover is gapless here too. Each
+phase is a full endpoint and may carry its own `middlewares`, e.g. a `transform`
+that reshapes the export into the table's shape. Everything above about a
+literal `index` and at-least-once delivery applies unchanged. See mq-bridge's
+[REFERENCE.md](https://github.com/marcomq/mq-bridge/blob/main/docs/REFERENCE.md#sequence).
 
 ### On Supabase
 
@@ -184,9 +230,52 @@ Same as any Postgres, with three things that otherwise look like bugs:
 
 `method: update` merges top-level fields into an existing document, so one route
 per source table — all writing the same `index` and `primary_key` — makes
-Meilisearch perform the join. A row from `movies` and a row from `directors`
-sharing `id: 1` become one document. Use a `transform` middleware first if the
-shapes need reshaping.
+Meilisearch perform the join. It joins on **the document's primary key only**:
+each message updates exactly the one document its own key names.
+
+**Tables sharing a key** (one-to-one) merge directly. `movie_stats` keyed by
+`movie_id` becomes part of the `movies` document once a `transform` renames the
+key and picks the fields to merge:
+
+```yaml
+routes:
+  movie_stats_to_search:
+    input:
+      postgres_cdc:
+        url: "postgres://user:pass@localhost/app"
+        publication: "movie_stats_pub"
+    output:
+      middlewares:
+        - transform:
+            mapping:
+              id: "$.movie_id"
+              rating: "$.rating"
+              votes: "$.votes"
+      custom:
+        name: meilisearch
+        config:
+          url: "http://localhost:7700"
+          index: "movies"
+          primary_key: "id"
+          method: update
+```
+
+**A foreign key does not merge.** A `directors` row changes the documents of
+every movie pointing at it, but the sink writes one document per message and
+cannot look up which ones those are. Denormalise in Postgres instead — keep
+`director_name` on `movies`, or maintain a table the publication covers with a
+trigger — so each row already is the document you want indexed. The same goes
+for one-to-many children such as a movie's genres: a list replaces the whole
+field (see [Limitations](#limitations)), so build it upstream.
+
+**Deletes remove the whole document.** With `operation` mapped, deleting a
+`movie_stats` row deletes the movie, not just its rating. Map `operation` only
+on the route that owns the document (`movies`) and leave it unset on the others:
+there a delete becomes an update carrying only the key (under the default
+replica identity), which changes nothing — the old rating stays until the next
+write. Routes are not ordered against each other, and `update` creates a
+document that does not exist yet, so a `movie_stats` change landing after its
+movie was deleted leaves a stub document holding only those fields.
 
 ## Reading an index back out
 
@@ -227,6 +316,12 @@ mqb copy --plugin ./libmq_bridge_meilisearch.so 'file://movies.jsonl?format=raw'
 mq_bridge::plugin::load_endpoint_plugin("./libmq_bridge_meilisearch.so")?;
 ```
 
+The library speaks plugin ABI 1.1, so the host must be mq-bridge 0.4.13 or
+newer. A URI query carries no types, so the host maps one against the schema
+this endpoint declares: `create_index=false`, `task_timeout_ms=30000` and
+`delete_values=delete,remove` reach the endpoint as a boolean, a number and a
+list.
+
 A package manager puts the same library where mq-bridge already looks, so
 nothing has to name a path:
 
@@ -253,8 +348,8 @@ for how loading, versioning and the ABI work, and
 Version 0.1 passes its suite against a real Meilisearch but has no production
 mileage — run it beside whatever you have now before cutting over.
 
-- **Backfill is a separate step**, not a snapshot phase the route hands over
-  from, and it is not resumable. This belongs in mq-bridge's Postgres source.
+- **Joins are by primary key only.** A foreign-key join has to be denormalised
+  upstream; see [Merging rows](#merging-rows-from-different-tables).
 - **`update` merges top-level fields only**: `{"tags": ["a"]}` replaces the whole
   array. Meilisearch's function-based edit applies to a filtered document set
   rather than one document per message, so it does not fit this sink. Compute

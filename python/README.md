@@ -36,12 +36,10 @@ exit_on_empty: true
 `library_path()` returns the absolute path of the bundled library, for a host
 that would rather call `load_endpoint_plugin` itself.
 
-Run a route using this plugin at `concurrency` 1. Meilisearch keys documents by
-primary key, so two batches touching one document must arrive in source order,
-and plugin ABI 1.0 has no slot for the flag that would let the endpoint ask the
-route to keep its sends sequenced. A YAML route already defaults to 1, but
-`mq-bridge copy` and the MCP route tools default to 4 — pass `--concurrency 1`
-or `"concurrency": 1` there.
+Use mq-bridge 0.4.13 or newer: the plugin speaks ABI 1.1, which lets it ask the
+route to keep its sends in source order at any `concurrency` — Meilisearch keys
+documents by primary key, so two batches touching one document must not be
+reordered.
 
 The mq-bridge dependency is deliberately not declared: the two packages are
 installed and upgraded independently, and `register()` reports a clear error if

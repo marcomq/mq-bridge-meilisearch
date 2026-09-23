@@ -167,6 +167,38 @@ async fn documents_carry_locating_metadata(
     Ok(())
 }
 
+/// What ABI 1.1 carries across the boundary: the ordering flag, and a failure
+/// reported for the messages it concerns rather than for the whole batch.
+async fn sends_are_ordered_and_fail_per_message(
+    factory: &dyn CustomEndpointFactory,
+    index: &str,
+) -> anyhow::Result<()> {
+    let publisher = factory.create_publisher(index, &config(index)).await?;
+    if !publisher.requires_ordered_publish() {
+        bail!("the publisher does not ask the route to keep its sends in order");
+    }
+
+    let mut invalid =
+        CanonicalMessage::from(json!({"id": "not a valid id!", "title": "doc"}).to_string());
+    invalid
+        .metadata
+        .insert("postgres.operation".to_owned(), "insert".to_owned());
+    let invalid_id = invalid.message_id;
+    let batch = vec![document(1, "insert"), document(2, "delete"), invalid];
+    match publisher.send_batch(batch).await? {
+        mq_bridge::SentBatch::Partial { failed, .. }
+            if failed.len() == 1 && failed[0].0.message_id == invalid_id => {}
+        other => bail!("expected only the invalid document to fail, got {other:?}"),
+    }
+
+    let mut consumer = factory.create_consumer(index, &config(index)).await?;
+    let ids = read_ids(&mut *consumer).await?;
+    if ids != vec![1] {
+        bail!("the runs before the failure should be indexed, found {ids:?}");
+    }
+    Ok(())
+}
+
 /// Runs every check against one factory, returning the names that passed. Each
 /// check gets its own index, so none can see another's documents.
 async fn suite(
@@ -185,11 +217,15 @@ async fn suite(
     documents_carry_locating_metadata(factory, &format!("{prefix}-metadata"))
         .await
         .context("check `documents_carry_locating_metadata` failed")?;
+    sends_are_ordered_and_fail_per_message(factory, &format!("{prefix}-partial"))
+        .await
+        .context("check `sends_are_ordered_and_fail_per_message` failed")?;
     Ok(vec![
         "round_trip",
         "delete_removes_the_document",
         "a_nacked_batch_is_read_again",
         "documents_carry_locating_metadata",
+        "sends_are_ordered_and_fail_per_message",
     ])
 }
 
@@ -235,6 +271,7 @@ async fn the_endpoint_behaves_the_same_linked_directly_and_loaded_as_a_plugin() 
         let library = build_plugin_cdylib(".", "mq-bridge-meilisearch").expect("build the plugin");
         let info = load_endpoint_plugin(&library).expect("load the plugin");
         assert_eq!(info.name, "meilisearch");
+        assert_eq!((info.abi_major, info.abi_minor), (1, 1));
         assert!(info.supports_consumer && info.supports_publisher);
         let factory = mq_bridge::extensions::get_endpoint_factory(&info.name)
             .expect("loading a plugin registers its endpoint");
