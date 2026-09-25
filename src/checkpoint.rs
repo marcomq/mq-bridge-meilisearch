@@ -1,75 +1,16 @@
-use std::{
-    collections::BTreeMap,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Context};
-use tokio::sync::Mutex;
+use anyhow::anyhow;
+use mq_bridge::checkpoint::FileCheckpointStore;
 
-/// A file-backed scan position: one JSON object mapping `<index>:<cursor_id>`
-/// to a value, so several routes can share one file without colliding.
-///
-/// mq-bridge's own [`checkpoint`](mq_bridge::checkpoint) store is not reused
-/// here because it is compiled only when one of the datastore features is on,
-/// and a plugin `cdylib` links its own copy of mq-bridge with default features
-/// off — a SQL or Mongo backend could never be reached from inside the plugin.
-pub(crate) struct FileCheckpoint {
-    path: PathBuf,
-    key: String,
-    write_lock: Mutex<()>,
-}
-
-impl FileCheckpoint {
-    pub(crate) fn new(path: impl Into<PathBuf>, index: &str, cursor_id: &str) -> Self {
-        Self {
-            path: path.into(),
-            key: format!("{index}:{cursor_id}"),
-            write_lock: Mutex::new(()),
-        }
-    }
-
-    pub(crate) async fn load(&self) -> anyhow::Result<Option<String>> {
-        Ok(self.read().await?.remove(&self.key))
-    }
-
-    pub(crate) async fn save(&self, value: &str) -> anyhow::Result<()> {
-        let _guard = self.write_lock.lock().await;
-        let mut entries = self.read().await?;
-        entries.insert(self.key.clone(), value.to_owned());
-        let encoded = serde_json::to_vec_pretty(&entries)
-            .context("failed to encode the Meilisearch checkpoint file")?;
-
-        if let Some(parent) = self
-            .path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-        {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .with_context(|| format!("failed to create '{}'", parent.display()))?;
-        }
-        // Written beside the target and renamed over it, so a crash mid-write
-        // leaves the previous position rather than a truncated file.
-        let temporary = self
-            .path
-            .with_extension(format!("{}.tmp", std::process::id()));
-        tokio::fs::write(&temporary, &encoded)
-            .await
-            .with_context(|| format!("failed to write '{}'", temporary.display()))?;
-        tokio::fs::rename(&temporary, &self.path)
-            .await
-            .with_context(|| format!("failed to update '{}'", self.path.display()))
-    }
-
-    async fn read(&self) -> anyhow::Result<BTreeMap<String, String>> {
-        match tokio::fs::read(&self.path).await {
-            Ok(bytes) => serde_json::from_slice(&bytes)
-                .with_context(|| format!("'{}' is not a checkpoint file", self.path.display())),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
-            Err(error) => Err(anyhow::Error::new(error)
-                .context(format!("failed to read '{}'", self.path.display()))),
-        }
-    }
+/// A file-backed scan position keyed `<index>:<cursor_id>`, so several routes
+/// can share one file. Only the file backend: Meilisearch stores documents, not cursors.
+pub(crate) fn file_store(
+    path: impl Into<PathBuf>,
+    index: &str,
+    cursor_id: &str,
+) -> FileCheckpointStore {
+    FileCheckpointStore::new(path, format!("{index}:{cursor_id}"))
 }
 
 /// Resolves a `checkpoint_store` spec to the file that holds the position.
@@ -111,6 +52,7 @@ pub(crate) fn check_writable(path: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mq_bridge::checkpoint::CheckpointStore;
 
     #[test]
     fn a_file_url_or_a_plain_path_both_name_the_same_file() {
@@ -142,11 +84,11 @@ mod tests {
         let directory = std::env::temp_dir().join(format!("mqb-meili-{}", uuid::Uuid::new_v4()));
         let path = directory.join("cursors.json");
 
-        let store = FileCheckpoint::new(&path, "movies", "scan");
+        let store = file_store(&path, "movies", "scan");
         assert_eq!(store.load().await.unwrap(), None);
         store.save("42").await.unwrap();
 
-        let reopened = FileCheckpoint::new(&path, "movies", "scan");
+        let reopened = file_store(&path, "movies", "scan");
         assert_eq!(reopened.load().await.unwrap().as_deref(), Some("42"));
 
         tokio::fs::remove_dir_all(&directory).await.ok();
@@ -158,17 +100,14 @@ mod tests {
         let directory = std::env::temp_dir().join(format!("mqb-meili-{}", uuid::Uuid::new_v4()));
         let path = directory.join("cursors.json");
 
-        FileCheckpoint::new(&path, "movies", "scan")
+        file_store(&path, "movies", "scan")
             .save("10")
             .await
             .unwrap();
-        FileCheckpoint::new(&path, "books", "scan")
-            .save("20")
-            .await
-            .unwrap();
+        file_store(&path, "books", "scan").save("20").await.unwrap();
 
         assert_eq!(
-            FileCheckpoint::new(&path, "movies", "scan")
+            file_store(&path, "movies", "scan")
                 .load()
                 .await
                 .unwrap()
@@ -176,7 +115,7 @@ mod tests {
             Some("10")
         );
         assert_eq!(
-            FileCheckpoint::new(&path, "books", "scan")
+            file_store(&path, "books", "scan")
                 .load()
                 .await
                 .unwrap()

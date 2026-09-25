@@ -25,7 +25,7 @@ crate-type = ["rlib", "cdylib"]
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"
-mq-bridge = { version = "0.4.13", default-features = false }
+mq-bridge = { version = "0.4.15", default-features = false }
 # Meilisearch's REST API directly, rather than the `meilisearch-sdk` crate: that
 # crate models documents as a typed `T`, which cannot round-trip the arbitrary
 # JSON a bridge carries, and it hides the HTTP status this endpoint classifies
@@ -40,7 +40,7 @@ tokio = { version = "1.34", features = ["rt-multi-thread", "macros", "sync", "ti
 tracing = "0.1"
 
 [dev-dependencies]
-mq-bridge = { version = "0.4.13", default-features = false, features = ["plugin-sdk", "test-utils"] }
+mq-bridge = { version = "0.4.15", default-features = false, features = ["plugin-sdk", "test-utils"] }
 serde_yaml = "0.9"
 uuid = { version = "1", features = ["v4"] }
 

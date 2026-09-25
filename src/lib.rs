@@ -69,3 +69,22 @@ impl CustomEndpointFactory for MeilisearchFactory {
         publisher::create(route_name, value).await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mq_bridge::errors::InvalidConfig;
+
+    #[tokio::test]
+    async fn a_rejected_configuration_stops_the_route_instead_of_reconnecting() {
+        let value = serde_json::json!({"url": "http://localhost:7700", "extra": true});
+        let consumer = MeilisearchFactory.create_consumer("route", &value).await;
+        let publisher = MeilisearchFactory.create_publisher("route", &value).await;
+        assert!(consumer
+            .err()
+            .is_some_and(|error| error.is::<InvalidConfig>()));
+        assert!(publisher
+            .err()
+            .is_some_and(|error| error.is::<InvalidConfig>()));
+    }
+}

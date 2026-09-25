@@ -7,14 +7,15 @@ use std::{
 use anyhow::anyhow;
 use async_trait::async_trait;
 use mq_bridge::{
-    errors::ConsumerError,
+    checkpoint::{CheckpointStore, FileCheckpointStore},
+    errors::{ConsumerError, InvalidConfig},
     traits::{BatchCommitFunc, EndpointStatus, MessageConsumer, MessageDisposition},
     CanonicalMessage, ReceivedBatch,
 };
 use tracing::{info, warn};
 
 use crate::{
-    checkpoint::{self, FileCheckpoint},
+    checkpoint,
     client::{MeiliClient, MeiliError},
     config::{self, MeilisearchConfig},
 };
@@ -78,7 +79,7 @@ struct MeilisearchConsumer {
     exit_on_empty: bool,
     offset: Arc<Mutex<u64>>,
     total: Arc<Mutex<u64>>,
-    checkpoint: Option<Arc<FileCheckpoint>>,
+    checkpoint: Option<Arc<FileCheckpointStore>>,
     backoff: Backoff,
 }
 
@@ -106,7 +107,7 @@ impl MeilisearchConsumer {
 fn build_checkpoint(
     settings: &MeilisearchConfig,
     index: &str,
-) -> anyhow::Result<Option<Arc<FileCheckpoint>>> {
+) -> anyhow::Result<Option<Arc<FileCheckpointStore>>> {
     let Some(cursor_id) = &settings.cursor_id else {
         warn!(
             index,
@@ -123,18 +124,19 @@ fn build_checkpoint(
     };
     let path = checkpoint::parse_spec(spec)?;
     checkpoint::check_writable(&path)?;
-    Ok(Some(Arc::new(FileCheckpoint::new(path, index, cursor_id))))
+    Ok(Some(Arc::new(checkpoint::file_store(
+        path, index, cursor_id,
+    ))))
 }
 
 pub(crate) async fn create(
     route_name: &str,
     value: &serde_json::Value,
 ) -> anyhow::Result<Box<dyn MessageConsumer>> {
-    let (settings, index) = config::resolve_for_consumer(route_name, value)?;
-    let client = MeiliClient::new(&settings)
-        .map_err(|error| anyhow::Error::new(ConsumerError::Permanent(error)))?;
-    let checkpoint = build_checkpoint(&settings, &index)
-        .map_err(|error| anyhow::Error::new(ConsumerError::Permanent(error)))?;
+    let (settings, index) =
+        config::resolve_for_consumer(route_name, value).map_err(InvalidConfig)?;
+    let client = MeiliClient::new(&settings).map_err(InvalidConfig)?;
+    let checkpoint = build_checkpoint(&settings, &index).map_err(InvalidConfig)?;
     let offset = match &checkpoint {
         Some(store) => store.load().await?.and_then(|value| {
             let parsed = value.parse::<u64>().ok();

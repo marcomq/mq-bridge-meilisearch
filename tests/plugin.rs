@@ -271,7 +271,7 @@ async fn the_endpoint_behaves_the_same_linked_directly_and_loaded_as_a_plugin() 
         let library = build_plugin_cdylib(".", "mq-bridge-meilisearch").expect("build the plugin");
         let info = load_endpoint_plugin(&library).expect("load the plugin");
         assert_eq!(info.name, "meilisearch");
-        assert_eq!((info.abi_major, info.abi_minor), (1, 1));
+        assert_eq!((info.abi_major, info.abi_minor), (1, 2));
         assert!(info.supports_consumer && info.supports_publisher);
         let factory = mq_bridge::extensions::get_endpoint_factory(&info.name)
             .expect("loading a plugin registers its endpoint");

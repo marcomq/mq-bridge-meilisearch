@@ -1,5 +1,4 @@
 use anyhow::{anyhow, Context};
-use mq_bridge::errors::{ConsumerError, PublisherError};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
@@ -188,36 +187,20 @@ pub(crate) fn is_template(value: &str) -> bool {
     value.contains("${")
 }
 
-/// A rejected configuration cannot heal by reconnecting, so both constructors
-/// below hand the route an error classified as permanent. An unclassified
-/// `anyhow::Error` reaches the route as a connection failure, which it retries
-/// on its reconnect interval forever.
 pub(crate) fn resolve_for_consumer(
     route_name: &str,
     value: &serde_json::Value,
 ) -> anyhow::Result<(MeilisearchConfig, String)> {
-    resolve(route_name, value)
-        .and_then(|(config, index)| {
-            if is_template(&index) {
-                Err(anyhow!(
-                    "Meilisearch `index` cannot be a template when reading: a reader pages through one index, so '{index}' has nothing to resolve against"
-                ))
-            } else {
-                Ok((config, index))
-            }
-        })
-        .map_err(|error| anyhow::Error::new(ConsumerError::Permanent(error)))
+    let (config, index) = resolve(route_name, value)?;
+    if is_template(&index) {
+        return Err(anyhow!(
+            "Meilisearch `index` cannot be a template when reading: a reader pages through one index, so '{index}' has nothing to resolve against"
+        ));
+    }
+    Ok((config, index))
 }
 
-pub(crate) fn resolve_for_publisher(
-    route_name: &str,
-    value: &serde_json::Value,
-) -> anyhow::Result<(MeilisearchConfig, String)> {
-    resolve(route_name, value)
-        .map_err(|error| anyhow::Error::new(PublisherError::NonRetryable(error)))
-}
-
-fn resolve(
+pub(crate) fn resolve(
     route_name: &str,
     value: &serde_json::Value,
 ) -> anyhow::Result<(MeilisearchConfig, String)> {
@@ -434,14 +417,10 @@ mod tests {
     fn a_templated_index_is_a_sink_only_feature() {
         let routed = value(serde_json::json!({"index": "${metadata:postgres.table}"}));
 
-        let (_, index) = resolve_for_publisher("route", &routed).unwrap();
+        let (_, index) = resolve("route", &routed).unwrap();
         assert_eq!(index, "${metadata:postgres.table}");
 
         let error = resolve_for_consumer("route", &routed).unwrap_err();
-        assert!(matches!(
-            error.downcast_ref::<ConsumerError>(),
-            Some(ConsumerError::Permanent(_))
-        ));
         assert!(format!("{error:#}").contains("cannot be a template"));
     }
 
@@ -451,22 +430,5 @@ mod tests {
         assert!(is_template("app_${metadata:postgres.table}"));
         assert!(!is_template("movies"));
         assert!(!is_template(""));
-    }
-
-    #[test]
-    fn a_rejected_configuration_is_permanent_so_the_route_stops_reconnecting() {
-        let rejected = value(serde_json::json!({"extra": true}));
-
-        let consumer_error = resolve_for_consumer("route", &rejected).unwrap_err();
-        assert!(matches!(
-            consumer_error.downcast_ref::<ConsumerError>(),
-            Some(ConsumerError::Permanent(_))
-        ));
-
-        let publisher_error = resolve_for_publisher("route", &rejected).unwrap_err();
-        assert!(matches!(
-            publisher_error.downcast_ref::<PublisherError>(),
-            Some(PublisherError::NonRetryable(_))
-        ));
     }
 }

@@ -6,7 +6,8 @@ use std::{
 use anyhow::{anyhow, Context};
 use async_trait::async_trait;
 use mq_bridge::{
-    errors::PublisherError,
+    errors::{InvalidConfig, PublisherError},
+    support::interpolation::CompiledTemplate,
     traits::{EndpointStatus, MessagePublisher},
     CanonicalMessage, SentBatch,
 };
@@ -120,36 +121,10 @@ fn describe(error: &MeiliError) -> String {
     }
 }
 
-/// Substitutes every `${metadata:<key>}` and `${payload:<field>}` in a template
-/// against one message, leaving the text around them alone, so `movies` and
-/// `app_${metadata:postgres.table}` are both usable. A key the message does not
-/// carry yields `None`: there is no sensible value to put in its place.
-fn resolve(template: &str, message: &CanonicalMessage) -> Option<String> {
-    let mut resolved = String::with_capacity(template.len());
-    let mut rest = template;
-    while let Some(open) = rest.find("${") {
-        let Some(close) = rest[open..].find('}').map(|offset| open + offset) else {
-            break;
-        };
-        resolved.push_str(&rest[..open]);
-        resolved.push_str(&lookup(&rest[open + 2..close], message)?);
-        rest = &rest[close + 1..];
-    }
-    resolved.push_str(rest);
-    Some(resolved)
-}
-
-/// One `${...}` token's value. A token naming no source is left as it was
-/// written rather than blanked, so a stray `${` cannot quietly eat a name.
-fn lookup(inner: &str, message: &CanonicalMessage) -> Option<String> {
-    let Some((source, name)) = inner.split_once(':') else {
-        return Some(format!("${{{inner}}}"));
-    };
-    match source.trim() {
-        "metadata" => message.metadata.get(name.trim()).cloned(),
-        "payload" => payload_field(message, name.trim()).map(stringify),
-        _ => Some(format!("${{{inner}}}")),
-    }
+/// A template's value for one message, or `None` when a token it names is absent:
+/// there is no sensible value to put in its place.
+fn resolve(template: &CompiledTemplate, message: &CanonicalMessage) -> Option<String> {
+    String::from_utf8(template.render_resolved(Some(message))?).ok()
 }
 
 fn payload_field(message: &CanonicalMessage, field: &str) -> Option<serde_json::Value> {
@@ -254,7 +229,7 @@ fn settle(
 /// Hands the failed messages back in source order, so a retry replays them in
 /// the order they were written.
 fn report(messages: Vec<CanonicalMessage>, failures: Vec<Option<RunFailure>>) -> SentBatch {
-    let failed: Vec<_> = messages
+    let failed = messages
         .into_iter()
         .zip(failures)
         .filter_map(|(message, failure)| {
@@ -268,23 +243,18 @@ fn report(messages: Vec<CanonicalMessage>, failures: Vec<Option<RunFailure>>) ->
             Some((message, classified))
         })
         .collect();
-    if failed.is_empty() {
-        return SentBatch::Ack;
-    }
-    SentBatch::Partial {
-        responses: None,
-        failed,
-    }
+    SentBatch::from_failures(failed)
 }
 
 struct MeilisearchPublisher {
     client: MeiliClient,
-    /// Either a literal index UID or a `${...}` template resolved per message.
+    /// The configured index, as written.
     index: String,
-    routed: bool,
+    /// Set when `index` is a `${...}` template, resolved per message.
+    index_template: Option<CompiledTemplate>,
     primary_key: Option<String>,
     method: WriteMethod,
-    operation: Option<String>,
+    operation: Option<CompiledTemplate>,
     delete_values: Vec<String>,
     wait_for_task: bool,
     max_request_bytes: usize,
@@ -320,10 +290,10 @@ impl MeilisearchPublisher {
     /// The index one message is written to. A literal `index` is the same for
     /// every message; a template is resolved against the message itself.
     fn target_index(&self, message: &CanonicalMessage) -> anyhow::Result<String> {
-        if !self.routed {
+        let Some(template) = &self.index_template else {
             return Ok(self.index.clone());
-        }
-        let resolved = resolve(&self.index, message).ok_or_else(|| {
+        };
+        let resolved = resolve(template, message).ok_or_else(|| {
             anyhow!(
                 "Meilisearch `index` template '{}' resolved to nothing for this message, so there is no index to write it to",
                 self.index
@@ -341,7 +311,7 @@ impl MeilisearchPublisher {
     /// Creates a routed index the first time it is written to. A literal index
     /// was already created at startup, before the first document could reach it.
     async fn ensure_index(&self, index: &str) -> Result<(), MeiliError> {
-        if !self.create_index || !self.routed {
+        if !self.create_index || self.index_template.is_none() {
             return Ok(());
         }
         if self.known_indexes.lock().await.contains(index) {
@@ -541,10 +511,12 @@ pub(crate) async fn create(
     route_name: &str,
     value: &serde_json::Value,
 ) -> anyhow::Result<Box<dyn MessagePublisher>> {
-    let (settings, index) = config::resolve_for_publisher(route_name, value)?;
-    let routed = config::is_template(&index);
-    let client = MeiliClient::new(&settings)
-        .map_err(|error| anyhow::Error::new(PublisherError::NonRetryable(error)))?;
+    let (settings, index) = config::resolve(route_name, value).map_err(InvalidConfig)?;
+    let client = MeiliClient::new(&settings).map_err(InvalidConfig)?;
+    let compile = |template: &str| CompiledTemplate::compile(template, None).map_err(InvalidConfig);
+    let index_template = Some(compile(&index)?).filter(CompiledTemplate::is_dynamic);
+    let routed = index_template.is_some();
+    let operation = settings.operation.as_deref().map(compile).transpose()?;
     // A routed index is not known until a message names it, so its creation is
     // deferred to the first write instead.
     if settings.create_index && !routed {
@@ -567,10 +539,10 @@ pub(crate) async fn create(
     Ok(Box::new(MeilisearchPublisher {
         client,
         index,
-        routed,
+        index_template,
         primary_key: settings.primary_key,
         method: settings.method,
-        operation: settings.operation,
+        operation,
         delete_values: settings.delete_values,
         wait_for_task: settings.wait_for_task,
         max_request_bytes: settings.max_request_bytes as usize,
@@ -663,6 +635,14 @@ impl MessagePublisher for MeilisearchPublisher {
 mod tests {
     use super::*;
 
+    fn template(text: &str) -> CompiledTemplate {
+        CompiledTemplate::compile(text, None).unwrap()
+    }
+
+    fn render(text: &str, message: &CanonicalMessage) -> Option<String> {
+        resolve(&template(text), message)
+    }
+
     fn publisher(operation: Option<&str>) -> MeilisearchPublisher {
         routing_publisher(operation, "movies")
     }
@@ -675,10 +655,10 @@ mod tests {
             )
             .unwrap(),
             index: index.to_owned(),
-            routed: config::is_template(index),
+            index_template: Some(template(index)).filter(CompiledTemplate::is_dynamic),
             primary_key: Some("id".to_owned()),
             method: WriteMethod::Replace,
-            operation: operation.map(str::to_owned),
+            operation: operation.map(template),
             delete_values: vec!["delete".to_owned()],
             wait_for_task: true,
             max_request_bytes: usize::MAX,
@@ -703,13 +683,13 @@ mod tests {
     fn tokens_resolve_from_metadata_payload_or_literally() {
         let message = message(7, Some("update"));
         assert_eq!(
-            resolve("${metadata:postgres.operation}", &message).as_deref(),
+            render("${metadata:postgres.operation}", &message).as_deref(),
             Some("update")
         );
-        assert_eq!(resolve("${payload:id}", &message).as_deref(), Some("7"));
-        assert_eq!(resolve("${payload:title}", &message).as_deref(), Some("x"));
-        assert_eq!(resolve("insert", &message).as_deref(), Some("insert"));
-        assert_eq!(resolve("${metadata:absent}", &message), None);
+        assert_eq!(render("${payload:id}", &message).as_deref(), Some("7"));
+        assert_eq!(render("${payload:title}", &message).as_deref(), Some("x"));
+        assert_eq!(render("insert", &message).as_deref(), Some("insert"));
+        assert_eq!(render("${metadata:absent}", &message), None);
     }
 
     #[test]
@@ -720,26 +700,26 @@ mod tests {
             .insert("postgres.table".to_owned(), "movies".to_owned());
 
         assert_eq!(
-            resolve("app_${metadata:postgres.table}", &message).as_deref(),
+            render("app_${metadata:postgres.table}", &message).as_deref(),
             Some("app_movies")
         );
         assert_eq!(
-            resolve("${metadata:postgres.table}_${payload:id}_v2", &message).as_deref(),
+            render("${metadata:postgres.table}_${payload:id}_v2", &message).as_deref(),
             Some("movies_7_v2")
         );
-        assert_eq!(resolve("${metadata:absent}_suffix", &message), None);
+        assert_eq!(render("${metadata:absent}_suffix", &message), None);
     }
 
     /// A `${` that names no source is text, not a silently empty substitution.
     #[test]
     fn an_unterminated_or_unknown_token_stays_as_written() {
         let message = message(7, None);
-        assert_eq!(resolve("a${b", &message).as_deref(), Some("a${b"));
+        assert_eq!(render("a${b", &message).as_deref(), Some("a${b"));
         assert_eq!(
-            resolve("${nosuch:x}", &message).as_deref(),
+            render("${nosuch:x}", &message).as_deref(),
             Some("${nosuch:x}")
         );
-        assert_eq!(resolve("${plain}", &message).as_deref(), Some("${plain}"));
+        assert_eq!(render("${plain}", &message).as_deref(), Some("${plain}"));
     }
 
     #[test]
@@ -1048,7 +1028,12 @@ mod tests {
     fn interleaved_writes_to_distinct_documents_share_one_segment() {
         let publisher = publisher(Some("${metadata:postgres.operation}"));
         let messages: Vec<_> = (1..=100)
-            .flat_map(|id| [message(id, Some("update")), message(1000 + id, Some("delete"))])
+            .flat_map(|id| {
+                [
+                    message(id, Some("update")),
+                    message(1000 + id, Some("delete")),
+                ]
+            })
             .collect();
 
         let Plan { runs, stopped, .. } = publisher.plan(&messages);
@@ -1130,7 +1115,14 @@ mod tests {
             .collect();
         assert_eq!(
             failed,
-            vec![Some(false), None, Some(false), Some(false), Some(false), Some(true)]
+            vec![
+                Some(false),
+                None,
+                Some(false),
+                Some(false),
+                Some(false),
+                Some(true)
+            ]
         );
     }
 
@@ -1167,7 +1159,12 @@ mod tests {
     #[test]
     fn document_ids_follow_meilisearchs_rule() {
         use serde_json::json;
-        for valid in [json!(7), json!(-1), json!("abc-DEF_09"), json!("x".repeat(511))] {
+        for valid in [
+            json!(7),
+            json!(-1),
+            json!("abc-DEF_09"),
+            json!("x".repeat(511)),
+        ] {
             assert!(is_valid_document_id(&valid), "{valid} should be valid");
         }
         for invalid in [
@@ -1180,7 +1177,10 @@ mod tests {
             json!(true),
             json!([1]),
         ] {
-            assert!(!is_valid_document_id(&invalid), "{invalid} should be invalid");
+            assert!(
+                !is_valid_document_id(&invalid),
+                "{invalid} should be invalid"
+            );
         }
     }
 
@@ -1195,13 +1195,17 @@ mod tests {
         let messages: Vec<_> = (1..=4).map(|id| message(id, None)).collect();
         let ids: Vec<_> = messages.iter().map(|message| message.message_id).collect();
 
-        let SentBatch::Partial { failed, .. } =
-            report(messages, vec![None, Some(boom(true)), None, Some(boom(false))])
-        else {
+        let SentBatch::Partial { failed, .. } = report(
+            messages,
+            vec![None, Some(boom(true)), None, Some(boom(false))],
+        ) else {
             panic!("a failed message must report a partial batch");
         };
 
-        let reported: Vec<_> = failed.iter().map(|(message, _)| message.message_id).collect();
+        let reported: Vec<_> = failed
+            .iter()
+            .map(|(message, _)| message.message_id)
+            .collect();
         assert_eq!(reported, vec![ids[1], ids[3]]);
         assert!(matches!(failed[0].1, PublisherError::Retryable(_)));
         assert!(matches!(failed[1].1, PublisherError::NonRetryable(_)));
