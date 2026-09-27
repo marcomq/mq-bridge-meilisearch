@@ -1,6 +1,6 @@
 {
   "name": "mq-bridge-meilisearch",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Meilisearch endpoint for mq-bridge, shipped as a native plugin",
   "license": "MIT OR Apache-2.0",
   "main": "index.js",
