@@ -307,6 +307,39 @@ impl MeiliClient {
         })
     }
 
+    /// Which of `ids` name a document in `index`, read through
+    /// `POST /documents/fetch` (Meilisearch 1.14+). Unknown ids are skipped.
+    pub(crate) async fn existing_ids(
+        &self,
+        index: &str,
+        primary_key: &str,
+        ids: &[String],
+    ) -> Result<Vec<serde_json::Value>, MeiliError> {
+        let body = serde_json::json!({
+            "ids": ids,
+            "fields": [primary_key],
+            "limit": ids.len(),
+        });
+        let request = self
+            .request(
+                reqwest::Method::POST,
+                &format!("/indexes/{index}/documents/fetch"),
+            )
+            .header("Content-Type", "application/json")
+            .body(serde_json::to_vec(&body).unwrap_or_default());
+        let body = self.send(request).await?;
+        let page: DocumentsPage = serde_json::from_str(&body).map_err(|error| {
+            MeiliError::transport(anyhow!(
+                "unexpected Meilisearch documents page '{body}': {error}"
+            ))
+        })?;
+        Ok(page
+            .results
+            .into_iter()
+            .filter_map(|mut document| document.get_mut(primary_key).map(serde_json::Value::take))
+            .collect())
+    }
+
     pub(crate) async fn health(&self) -> Result<(), MeiliError> {
         self.send(self.request(reqwest::Method::GET, "/health"))
             .await

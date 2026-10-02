@@ -226,6 +226,9 @@ fn settle(
     failures
 }
 
+/// How many ids one existence check asks about; keeps the request small.
+const EXISTENCE_CHECK_CHUNK: usize = 1_000;
+
 /// Hands the failed messages back in source order, so a retry replays them in
 /// the order they were written.
 fn report(messages: Vec<CanonicalMessage>, failures: Vec<Option<RunFailure>>) -> SentBatch {
@@ -461,6 +464,49 @@ impl MeilisearchPublisher {
             .collect()
     }
 
+    /// Keeps only the messages whose document already exists in `index`, for
+    /// `update_existing`. Messages dropped here are acknowledged unwritten.
+    async fn keep_existing<'a>(
+        &self,
+        index: &str,
+        messages: Vec<&'a CanonicalMessage>,
+    ) -> Result<Vec<&'a CanonicalMessage>, RunFailure> {
+        let Some(primary_key) = self.primary_key.as_deref() else {
+            return Ok(messages);
+        };
+        let keys = messages
+            .iter()
+            .map(|message| self.document_key(message).map(Option::unwrap_or_default))
+            .collect::<anyhow::Result<Vec<String>>>()
+            .map_err(RunFailure::permanent)?;
+        let mut wanted: Vec<String> = keys
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        wanted.sort_unstable();
+        let mut existing = HashSet::with_capacity(wanted.len());
+        for chunk in wanted.chunks(EXISTENCE_CHECK_CHUNK) {
+            let found = self.client.existing_ids(index, primary_key, chunk).await?;
+            existing.extend(found.into_iter().map(stringify));
+        }
+        let kept: Vec<_> = messages
+            .into_iter()
+            .zip(keys)
+            .filter_map(|(message, key)| existing.contains(&key).then_some(message))
+            .collect();
+        let skipped = wanted.len() - existing.len();
+        if skipped > 0 {
+            tracing::debug!(
+                index,
+                skipped,
+                "Meilisearch update_existing skipped documents that do not exist"
+            );
+        }
+        Ok(kept)
+    }
+
     /// Enqueues one run and returns its tasks without waiting for them.
     async fn issue_run(
         &self,
@@ -470,6 +516,10 @@ impl MeilisearchPublisher {
         self.ensure_index(&run.index).await?;
         let selected = run.positions.iter().map(|&position| &messages[position]);
         match run.op {
+            Op::Upsert if self.method == WriteMethod::UpdateExisting => {
+                let kept = self.keep_existing(&run.index, selected.collect()).await?;
+                self.send_documents(&run.index, kept).await
+            }
             Op::Upsert => self.send_documents(&run.index, selected).await,
             Op::Delete => {
                 let ids = self.delete_ids(selected).map_err(RunFailure::permanent)?;

@@ -1,0 +1,77 @@
+# Postgres -> Meilisearch with a foreign-key join and a merged child table.
+# Needs mq-bridge 0.4.16+ (`lookup`) and mq-bridge-meilisearch 0.1.3+ (`update_existing`).
+#
+#   CREATE TABLE authors    (id int PRIMARY KEY, name text);
+#   CREATE TABLE books      (id int PRIMARY KEY, title text, author_id int REFERENCES authors);
+#   CREATE TABLE book_stats (book_id int PRIMARY KEY REFERENCES books ON DELETE CASCADE, rating int, votes int);
+#
+# One `books` document per book: {id, title, author_id, author: {id, name},
+# stats: {book_id, rating, votes}}.
+#
+#   mq-bridge-app --config postgres_to_meilisearch.yaml
+routes:
+  # Owns the document: backfills the table, then streams changes. Each write
+  # looks up the author and the stats, one query per batch each.
+  books_to_search:
+    batch_size: 500
+    input:
+      postgres_cdc:
+        url: "postgres://postgres:postgres@localhost:5432/app"
+        publication: "books_pub"
+        create_publication: true
+        publication_tables: ["books"]
+        slot_name: "mqb_books"
+        consume: capture_all
+        checkpoint_store: "file:///var/lib/mq-bridge/books.json"
+    output:
+      middlewares:
+        - lookup:
+            entries:
+              - into: author
+                from:
+                  sqlx:
+                    url: "postgres://postgres:postgres@localhost:5432/app"
+                    table: "authors"
+                    lookup_query: "SELECT id, name FROM authors WHERE id IN (${payload:author_id}::int)"
+              - into: stats
+                from:
+                  sqlx:
+                    url: "postgres://postgres:postgres@localhost:5432/app"
+                    table: "book_stats"
+                    lookup_query: "SELECT book_id, rating, votes FROM book_stats WHERE book_id IN (${payload:id}::int)"
+      custom:
+        name: meilisearch
+        config:
+          url: "http://localhost:7700"
+          api_key: "${MEILI_MASTER_KEY}"
+          index: "books"
+          primary_key: "id"
+          operation: "${metadata:postgres.operation}"
+
+  # Follows later stats changes into documents that already exist. No backfill:
+  # the books route already read the current stats. A stats row for a missing
+  # (or deleted) book is skipped instead of becoming a stub document.
+  book_stats_to_search:
+    input:
+      postgres_cdc:
+        url: "postgres://postgres:postgres@localhost:5432/app"
+        publication: "book_stats_pub"
+        create_publication: true
+        publication_tables: ["book_stats"]
+        slot_name: "mqb_book_stats"
+    output:
+      middlewares:
+        - transform:
+            mapping:
+              id: "$.book_id"
+              "stats.book_id": "$.book_id"
+              "stats.rating": "$.rating"
+              "stats.votes": "$.votes"
+      custom:
+        name: meilisearch
+        config:
+          url: "http://localhost:7700"
+          api_key: "${MEILI_MASTER_KEY}"
+          index: "books"
+          primary_key: "id"
+          method: update_existing

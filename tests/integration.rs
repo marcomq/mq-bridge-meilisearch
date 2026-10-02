@@ -218,6 +218,51 @@ async fn update_merges_rows_from_different_tables_into_one_document() {
     .await;
 }
 
+/// A child row whose parent document is gone must not recreate it as a stub.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn update_existing_skips_documents_that_do_not_exist() {
+    run_test_with_docker("tests/docker-compose.yml", || async {
+        let factory = factory();
+        let index = index_name("existing");
+        let owner = factory
+            .create_publisher(&index, &config(&index, serde_json::json!({})))
+            .await
+            .expect("create the owning publisher");
+        owner
+            .send_batch(vec![document(1, "Stalker", None)])
+            .await
+            .expect("publish the parent row");
+
+        let child_config = config(&index, serde_json::json!({"method": "update_existing"}));
+        let child = factory
+            .create_publisher(&index, &child_config)
+            .await
+            .expect("create the update_existing publisher");
+        let sent = child
+            .send_batch(vec![
+                CanonicalMessage::from(serde_json::json!({"id": 1, "rating": 8}).to_string()),
+                CanonicalMessage::from(serde_json::json!({"id": 2, "rating": 5}).to_string()),
+            ])
+            .await
+            .expect("publish two child rows");
+        assert!(
+            matches!(sent, SentBatch::Ack),
+            "a skipped row is acknowledged"
+        );
+
+        let mut consumer = factory
+            .create_consumer(&index, &child_config)
+            .await
+            .expect("create Meilisearch consumer");
+        let documents = read_all(&mut *consumer).await;
+        assert_eq!(ids(&documents), vec![1]);
+        assert_eq!(documents[0]["title"], "Stalker");
+        assert_eq!(documents[0]["rating"], 8);
+    })
+    .await;
+}
+
 /// Meilisearch answers a write with 202 and applies it afterwards. Acking on
 /// that 202 would commit the source cursor for a write that then failed, so the
 /// publisher waits for the task and reports the failure back to the route.

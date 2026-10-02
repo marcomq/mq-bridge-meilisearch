@@ -35,7 +35,7 @@ output:
 | `api_key` | both | none | Sent as `Authorization: Bearer`. Omit for an instance with no master key. |
 | `index` | both | route name | Index UID. On an output, may contain templates. |
 | `primary_key` | both | none | The field Meilisearch keys documents by. |
-| `method` | output | `replace` | `replace` overwrites a document; `update` merges top-level fields into it. |
+| `method` | output | `replace` | `replace` overwrites a document; `update` merges top-level fields into it; `update_existing` merges only into a document that already exists. |
 | `operation` | output | none | Each message's change operation, e.g. `${metadata:postgres.operation}`. |
 | `delete_values` | output | `["delete"]` | Operation values that mean "remove this document". |
 | `create_index` | output | `true` | Create the index before the first write. |
@@ -268,23 +268,111 @@ routes:
           method: update
 ```
 
-**A foreign key does not merge.** A `directors` row changes the documents of
-every movie pointing at it, but the sink writes one document per message and
-cannot look up which ones those are. Denormalise in Postgres instead — keep
-`director_name` on `movies`, or maintain a table the publication covers with a
-trigger — so each row already is the document you want indexed. The same goes
-for one-to-many children such as a movie's genres: a list replaces the whole
-field (see [Limitations](#limitations)), so build it upstream.
+**A foreign key is joined with `lookup`** (mq-bridge 0.4.16+). A `lookup`
+middleware in front of the sink reads the referenced row and writes it into the
+document before it is indexed; with the key inside `IN (…)` it costs one query
+per batch, not per message:
+
+```yaml
+output:
+  middlewares:
+    - lookup:
+        from:
+          sqlx:
+            url: "postgres://user:pass@localhost/app"
+            table: "authors"
+            lookup_query: "SELECT id, name FROM authors WHERE id IN (${payload:author_id}::int)"
+        into: author
+  custom:
+    name: meilisearch
+    config: { url: "http://localhost:7700", index: "books", primary_key: "id" }
+```
+
+[`examples/postgres_to_meilisearch.yaml`](examples/postgres_to_meilisearch.yaml)
+puts it together: `books` owns the document and looks up its author and its
+stats, and a second route follows later `book_stats` changes with
+`update_existing`. Two things `lookup` does not do:
+
+- **A parent change does not reach its children.** Renaming an author leaves
+  existing books with the old name until each book is written again.
+- **It answers with one row.** A one-to-many child, such as a book's genres,
+  still has to be built upstream; a list replaces the whole field (see
+  [Limitations](#limitations)).
 
 **Deletes remove the whole document.** With `operation` mapped, deleting a
 `movie_stats` row deletes the movie, not just its rating. Map `operation` only
 on the route that owns the document (`movies`) and leave it unset on the others:
-there a delete becomes an update carrying only the key (under the default
-replica identity), which changes nothing — the old rating stays until the next
-write. Under `REPLICA IDENTITY FULL` the delete carries the whole old row, so it
-writes the old values back instead. Routes are not ordered against each other, and `update` creates a
-document that does not exist yet, so a `movie_stats` change landing after its
-movie was deleted leaves a stub document holding only those fields.
+there a delete becomes an update carrying the key with every other column
+`null` (under the default replica identity), so the rating is cleared rather
+than the movie removed. Under `REPLICA IDENTITY FULL` the delete carries the
+whole old row, so it writes the old values back instead. Routes are not ordered
+against each other, and `update` creates a document that does not exist yet, so
+a `movie_stats` change landing after its movie was deleted leaves a stub
+document holding only those fields.
+
+**`method: update_existing` prevents those stubs** (0.1.3+). Use it on the routes that
+only add to a document (`movie_stats` above), not on the one that owns it.
+Before each write it asks Meilisearch which of the batch's documents exist
+(`POST /documents/fetch`, Meilisearch 1.14+), merges into those and
+acknowledges the rest unwritten. It needs `primary_key` and cannot be combined
+with `operation`. A parent delete still queued in Meilisearch when the check runs
+is not seen yet, so the window shrinks to the indexing delay rather than closing.
+
+## Composite primary keys
+
+Meilisearch keys a document by one field. For a table keyed by several columns,
+build that field with a `transform` expression; a delete still carries the key
+columns, so it names the same document:
+
+```yaml
+output:
+  middlewares:
+    - transform:
+        expression: >-
+          { id: string(order_id) + '-' + string(line_no),
+            order_id: order_id, line_no: line_no, sku: sku, qty: qty }
+  custom:
+    name: meilisearch
+    config:
+      url: "http://localhost:7700"
+      index: "order_lines"
+      primary_key: "id"
+      operation: "${metadata:postgres.operation}"
+```
+
+The expression returns the whole document, so list every field to keep. The
+parts may only use `a-z A-Z 0-9 - _`, Meilisearch's rule for an id. `capture_all`
+cannot back fill such a table, since it pages by a single key column: stream it
+with the default `capture_new`, or back fill it through a `sequence` with a
+unique `cursor_column`.
+
+## Rebuilding an index
+
+After changing a `transform` or the index's `settings`, re-read the table. One
+command does it for a document that maps 1:1 to a table:
+
+```console
+mq-bridge-app copy --drain \
+  'postgres://user:pass@localhost/app?table=movies&cursor_column=id' \
+  'meilisearch://localhost:7700?index=movies&primary_key=id&api_key=…'
+```
+
+A route with `lookup`s re-reads the same way from a config: run the owning
+route once more with a new `slot_name` and `checkpoint_store` and
+`consume: capture_all`, then drop the old slot with
+`SELECT pg_drop_replication_slot('…')` — it retains WAL until dropped.
+
+**Without downtime,** build the new version under another name and swap it in.
+Searches keep hitting the old index until the swap, which is atomic:
+
+1. Stop the streaming route. Its slot keeps the changes that arrive meanwhile.
+2. Copy the settings: `GET /indexes/movies/settings`, then `PATCH` them onto
+   `movies_v2`, or set `settings` on the rebuilding endpoint.
+3. Rebuild into `movies_v2` with the command above (`index=movies_v2`).
+4. `POST /swap-indexes` with `[{"indexes": ["movies", "movies_v2"]}]`, then
+   `DELETE /indexes/movies_v2`, which now holds the old documents.
+5. Start the streaming route again. It replays the changes from step 1 into the
+   rebuilt index.
 
 ## Reading an index back out
 
@@ -357,16 +445,15 @@ for how loading, versioning and the ABI work, and
 Version 0.1 passes its suite against a real Meilisearch but has no production
 mileage — run it beside whatever you have now before cutting over.
 
-- **Joins are by primary key only.** A foreign-key join has to be denormalised
-  upstream; see [Merging rows](#merging-rows-from-different-tables). If your
-  documents are built from lookups across tables, a CDC tool with SQL
-  enrichment (such as Sequin) fits better than this sink.
+- **Joined fields go stale when the parent changes.** A `lookup` reads the
+  referenced row when the child is written; a later change to that row is not
+  pushed into existing documents. See [Merging rows](#merging-rows-from-different-tables).
 - **`update` merges top-level fields only**: `{"tags": ["a"]}` replaces the whole
   array. Meilisearch's function-based edit applies to a filtered document set
   rather than one document per message, so it does not fit this sink. Compute
   the value upstream.
-- **No replay log.** Recovering from a bad transform means re-running the
-  backfill. Put a durable queue in front of the sink if you need better.
+- **No replay log.** Recovering from a bad transform means re-reading the
+  source; see [Rebuilding an index](#rebuilding-an-index).
 - **`checkpoint_store` takes a file only.** Write it as `file:///…`, the form
   `postgres_cdc` needs too. mq-bridge's SQL, Mongo and
   object-store backends sit behind its own feature flags, which a plugin

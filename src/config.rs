@@ -14,10 +14,15 @@ pub enum WriteMethod {
     /// document, leaving every field the payload omits untouched. This is what
     /// lets several source tables write into one shared document.
     Update,
+    /// Like `update`, but only into documents that already exist; a message
+    /// whose document is missing is acknowledged without being written, so a
+    /// child table cannot recreate a deleted parent as a stub.
+    #[serde(rename = "update_existing")]
+    UpdateExisting,
 }
 
 impl WriteMethod {
-    const ALL: [Self; 2] = [Self::Replace, Self::Update];
+    const ALL: [Self; 3] = [Self::Replace, Self::Update, Self::UpdateExisting];
 
     /// The spelling `rename_all = "lowercase"` gives each variant. Exhaustive,
     /// so a new variant cannot reach the schema unnamed.
@@ -25,13 +30,14 @@ impl WriteMethod {
         match self {
             WriteMethod::Replace => "replace",
             WriteMethod::Update => "update",
+            WriteMethod::UpdateExisting => "update_existing",
         }
     }
 
     pub(crate) fn http_method(self) -> reqwest::Method {
         match self {
             WriteMethod::Replace => reqwest::Method::POST,
-            WriteMethod::Update => reqwest::Method::PUT,
+            WriteMethod::Update | WriteMethod::UpdateExisting => reqwest::Method::PUT,
         }
     }
 }
@@ -224,6 +230,20 @@ pub(crate) fn resolve(
             "Meilisearch `primary_key` is required when `operation` is set, so a delete can name the document to remove"
         ));
     }
+    if config.method == WriteMethod::UpdateExisting {
+        if config.primary_key.is_none() {
+            return Err(anyhow!(
+                "Meilisearch `primary_key` is required with `method: update_existing`, so each document can be looked up before it is written"
+            ));
+        }
+        // An earlier delete run of the same batch is enqueued but not yet
+        // applied when the existence check runs, so it could not see it.
+        if config.operation.is_some() {
+            return Err(anyhow!(
+                "Meilisearch `method: update_existing` cannot be combined with `operation`: map `operation` on the route that owns the document instead"
+            ));
+        }
+    }
     if config.max_request_bytes == 0 {
         return Err(anyhow!(
             "Meilisearch `max_request_bytes` must be greater than 0"
@@ -286,6 +306,21 @@ mod tests {
         let mut with_key = mapped;
         with_key["primary_key"] = serde_json::json!("id");
         assert!(resolve("route", &value(with_key)).is_ok());
+    }
+
+    #[test]
+    fn update_existing_needs_a_key_and_no_operation() {
+        let method = serde_json::json!({"method": "update_existing"});
+        assert!(resolve("route", &value(method.clone())).is_err());
+
+        let mut keyed = method;
+        keyed["primary_key"] = serde_json::json!("id");
+        let (config, _) = resolve("route", &value(keyed.clone())).unwrap();
+        assert_eq!(config.method, WriteMethod::UpdateExisting);
+        assert_eq!(config.method.http_method(), reqwest::Method::PUT);
+
+        keyed["operation"] = serde_json::json!("${metadata:postgres.operation}");
+        assert!(resolve("route", &value(keyed)).is_err());
     }
 
     #[test]
