@@ -1,9 +1,22 @@
+use std::io::Write;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context};
 use serde::Deserialize;
 
-use crate::config::{MeilisearchConfig, WriteMethod};
+use crate::config::{Compression, MeilisearchConfig, WriteMethod};
+
+/// The level mq-bridge's own HTTP endpoint compresses at.
+const GZIP_LEVEL: u32 = 4;
+
+fn gzip(data: &[u8]) -> std::io::Result<Vec<u8>> {
+    let mut encoder = flate2::write::GzEncoder::new(
+        Vec::with_capacity(data.len() / 4),
+        flate2::Compression::new(GZIP_LEVEL),
+    );
+    encoder.write_all(data)?;
+    encoder.finish()
+}
 
 /// Meilisearch's own name for "this index is already there", which
 /// [`MeiliClient::create_index`] treats as success.
@@ -94,6 +107,7 @@ pub(crate) struct MeiliClient {
     base: String,
     api_key: Option<String>,
     task_timeout: Duration,
+    compression: Compression,
 }
 
 impl MeiliClient {
@@ -117,6 +131,7 @@ impl MeiliClient {
             base,
             api_key: config.api_key.clone().filter(|key| !key.trim().is_empty()),
             task_timeout: Duration::from_millis(config.task_timeout_ms),
+            compression: config.compression,
         })
     }
 
@@ -210,13 +225,36 @@ impl MeiliClient {
         method: WriteMethod,
         ndjson: Vec<u8>,
     ) -> Result<u64, MeiliError> {
+        let request = self
+            .documents_request(index, primary_key, method, ndjson)
+            .await?;
+        self.send_for_task(request).await
+    }
+
+    async fn documents_request(
+        &self,
+        index: &str,
+        primary_key: Option<&str>,
+        method: WriteMethod,
+        ndjson: Vec<u8>,
+    ) -> Result<reqwest::RequestBuilder, MeiliError> {
         let mut request = self
             .request(method.http_method(), &format!("/indexes/{index}/documents"))
             .header("Content-Type", "application/x-ndjson");
         if let Some(key) = primary_key {
             request = request.query(&[("primaryKey", key)]);
         }
-        self.send_for_task(request.body(ndjson)).await
+        Ok(match self.compression {
+            Compression::None => request.body(ndjson),
+            Compression::Gzip => {
+                // A body can be tens of MB, too long to hold an async worker.
+                let body = tokio::task::spawn_blocking(move || gzip(&ndjson))
+                    .await
+                    .map_err(MeiliError::transport)?
+                    .map_err(MeiliError::transport)?;
+                request.header("Content-Encoding", "gzip").body(body)
+            }
+        })
     }
 
     pub(crate) async fn delete_documents(
@@ -405,6 +443,49 @@ mod tests {
             MeiliClient::new(&settings).unwrap().api_key.as_deref(),
             Some("secret")
         );
+    }
+
+    const NDJSON: &[u8] = b"{\"id\":1,\"title\":\"one\"}\n{\"id\":2,\"title\":\"two\"}\n";
+
+    async fn documents_request(compression: &str) -> reqwest::Request {
+        let mut settings = config("http://localhost:7700");
+        settings.compression = serde_json::from_value(serde_json::json!(compression)).unwrap();
+        MeiliClient::new(&settings)
+            .unwrap()
+            .documents_request("movies", Some("id"), WriteMethod::Replace, NDJSON.to_vec())
+            .await
+            .unwrap()
+            .build()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn without_compression_the_ndjson_is_sent_as_it_is() {
+        let request = documents_request("none").await;
+        assert_eq!(request.method(), reqwest::Method::POST);
+        assert_eq!(
+            request.url().as_str(),
+            "http://localhost:7700/indexes/movies/documents?primaryKey=id"
+        );
+        let headers: Vec<_> = request.headers().iter().collect();
+        assert_eq!(headers.len(), 1, "{headers:?}");
+        assert_eq!(request.headers()["content-type"], "application/x-ndjson");
+        assert_eq!(request.body().unwrap().as_bytes(), Some(NDJSON));
+    }
+
+    #[tokio::test]
+    async fn gzip_sends_the_same_ndjson_compressed_and_says_so() {
+        let request = documents_request("gzip").await;
+        assert_eq!(request.headers().len(), 2);
+        assert_eq!(request.headers()["content-type"], "application/x-ndjson");
+        assert_eq!(request.headers()["content-encoding"], "gzip");
+
+        let plain = documents_request("none").await;
+        assert_eq!(request.url(), plain.url());
+        let sent = request.body().unwrap().as_bytes().unwrap();
+        let mut decoded = Vec::new();
+        std::io::Read::read_to_end(&mut flate2::read::GzDecoder::new(sent), &mut decoded).unwrap();
+        assert_eq!(Some(decoded.as_slice()), plain.body().unwrap().as_bytes());
     }
 
     #[test]

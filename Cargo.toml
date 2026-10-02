@@ -25,6 +25,8 @@ crate-type = ["rlib", "cdylib"]
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"
+# Pure-Rust backend, named explicitly: this crate is built with default features off.
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
 mq-bridge = { version = "0.4.15", default-features = false }
 # Meilisearch's REST API directly, rather than the `meilisearch-sdk` crate: that
 # crate models documents as a typed `T`, which cannot round-trip the arbitrary

@@ -42,6 +42,26 @@ impl WriteMethod {
     }
 }
 
+/// How document request bodies are compressed.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Compression {
+    #[default]
+    None,
+    Gzip,
+}
+
+impl Compression {
+    const ALL: [Self; 2] = [Self::None, Self::Gzip];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Compression::None => "none",
+            Compression::Gzip => "gzip",
+        }
+    }
+}
+
 fn default_true() -> bool {
     true
 }
@@ -126,6 +146,10 @@ pub struct MeilisearchConfig {
     /// than rejected whole as `payload_too_large`.
     #[serde(default = "default_max_request_bytes")]
     pub max_request_bytes: u64,
+    /// Output only: compression of document request bodies (`none`, `gzip`).
+    #[serde(default)]
+    #[schemars(schema_with = "compression_schema")]
+    pub compression: Compression,
     #[serde(default)]
     pub connect_timeout_ms: Option<u64>,
     #[serde(default)]
@@ -157,6 +181,14 @@ fn write_method_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
     schemars::json_schema!({
         "type": "string",
         "enum": WriteMethod::ALL.map(WriteMethod::as_str),
+    })
+}
+
+/// `compression` as a flat `enum`, for the same reason as `method`.
+fn compression_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": "string",
+        "enum": Compression::ALL.map(Compression::as_str),
     })
 }
 
@@ -402,6 +434,29 @@ mod tests {
         for (value, variant) in declared.iter().zip(WriteMethod::ALL) {
             assert_eq!(
                 serde_json::from_value::<WriteMethod>(value.clone()).unwrap(),
+                variant
+            );
+        }
+    }
+
+    #[test]
+    fn compression_is_off_unless_asked_for() {
+        let (config, _) = resolve("route", &value(serde_json::json!({}))).unwrap();
+        assert_eq!(config.compression, Compression::None);
+
+        let (gzip, _) =
+            resolve("route", &value(serde_json::json!({"compression": "gzip"}))).unwrap();
+        assert_eq!(gzip.compression, Compression::Gzip);
+        assert!(resolve("route", &value(serde_json::json!({"compression": "zstd"}))).is_err());
+
+        let schema = config_schema().expect("a schema");
+        let declared = schema["properties"]["compression"]["enum"]
+            .as_array()
+            .expect("an enum");
+        assert_eq!(declared.len(), Compression::ALL.len());
+        for (value, variant) in declared.iter().zip(Compression::ALL) {
+            assert_eq!(
+                serde_json::from_value::<Compression>(value.clone()).unwrap(),
                 variant
             );
         }

@@ -651,6 +651,34 @@ async fn settings_are_applied_to_the_index_before_documents_arrive() {
     .await;
 }
 
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn gzip_compressed_documents_are_indexed_and_searchable() {
+    run_test_with_docker("tests/docker-compose.yml", || async {
+        let index = index_name("gzip");
+        let publisher = factory()
+            .create_publisher(
+                &index,
+                &config(&index, serde_json::json!({"compression": "gzip"})),
+            )
+            .await
+            .expect("create Meilisearch publisher");
+
+        let sent = publisher
+            .send_batch(vec![
+                document(1, "compressed", None),
+                document(2, "plain", None),
+            ])
+            .await
+            .expect("send the compressed batch");
+        assert!(matches!(sent, SentBatch::Ack), "{sent:?}");
+
+        let found = get(&format!("/indexes/{index}/search?q=compressed")).await;
+        assert_eq!(ids(found["hits"].as_array().expect("hits")), vec![1]);
+    })
+    .await;
+}
+
 /// A batch larger than one request must still arrive whole, in order, rather
 /// than being dead-lettered as `payload_too_large`.
 #[tokio::test]

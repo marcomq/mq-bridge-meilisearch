@@ -43,6 +43,7 @@ output:
 | `wait_for_task` | output | `true` | Wait for the indexing task to finish before acknowledging. |
 | `task_timeout_ms` | output | `60000` | How long to wait for one task. |
 | `max_request_bytes` | output | `90000000` | Split a batch into several requests rather than exceed this body size. |
+| `compression` | output | `none` | `gzip` compresses document request bodies (`Content-Encoding: gzip`). `max_request_bytes` still counts uncompressed bytes, which is what Meilisearch's payload limit applies to. |
 | `connect_timeout_ms` | both | `10000` | TCP/TLS connect timeout. |
 | `request_timeout_ms` | both | none | Whole-request timeout. |
 | `fields` | input | all | Comma-separated document fields to read. |
