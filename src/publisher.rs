@@ -466,6 +466,8 @@ impl MeilisearchPublisher {
 
     /// Keeps only the messages whose document already exists in `index`, for
     /// `update_existing`. Messages dropped here are acknowledged unwritten.
+    /// Waits for the index's queued writes first, so a parent another route
+    /// just created or deleted is seen.
     async fn keep_existing<'a>(
         &self,
         index: &str,
@@ -474,6 +476,12 @@ impl MeilisearchPublisher {
         let Some(primary_key) = self.primary_key.as_deref() else {
             return Ok(messages);
         };
+        if let Some(task) = self.client.latest_pending_task(index).await? {
+            match self.client.wait_for_task(task).await {
+                Ok(()) | Err(MeiliError::Task { .. }) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
         let keys = messages
             .iter()
             .map(|message| self.document_key(message).map(Option::unwrap_or_default))

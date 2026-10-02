@@ -307,6 +307,32 @@ impl MeiliClient {
         })
     }
 
+    /// The newest task on `index` that has not finished yet. Meilisearch applies
+    /// an index's tasks in uid order, so once it is done every earlier write is.
+    pub(crate) async fn latest_pending_task(&self, index: &str) -> Result<Option<u64>, MeiliError> {
+        #[derive(Deserialize)]
+        struct Task {
+            uid: u64,
+        }
+        #[derive(Deserialize)]
+        struct Tasks {
+            results: Vec<Task>,
+        }
+        let body = self
+            .send(self.request(reqwest::Method::GET, "/tasks").query(&[
+                ("indexUids", index),
+                ("statuses", "enqueued,processing"),
+                ("limit", "1"),
+            ]))
+            .await?;
+        let tasks: Tasks = serde_json::from_str(&body).map_err(|error| {
+            MeiliError::transport(anyhow!(
+                "unexpected Meilisearch task list '{body}': {error}"
+            ))
+        })?;
+        Ok(tasks.results.first().map(|task| task.uid))
+    }
+
     /// Which of `ids` name a document in `index`, read through
     /// `POST /documents/fetch` (Meilisearch 1.14+). Unknown ids are skipped.
     pub(crate) async fn existing_ids(

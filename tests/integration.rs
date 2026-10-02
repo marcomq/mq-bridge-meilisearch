@@ -218,7 +218,8 @@ async fn update_merges_rows_from_different_tables_into_one_document() {
     .await;
 }
 
-/// A child row whose parent document is gone must not recreate it as a stub.
+/// A child row whose parent document is gone must not recreate it as a stub,
+/// while one whose parent is still queued in Meilisearch must wait for it.
 #[tokio::test]
 #[ignore = "requires Docker"]
 async fn update_existing_skips_documents_that_do_not_exist() {
@@ -239,13 +240,23 @@ async fn update_existing_skips_documents_that_do_not_exist() {
             .create_publisher(&index, &child_config)
             .await
             .expect("create the update_existing publisher");
+        let queued = reqwest::Client::new()
+            .post(format!("{URL}/indexes/{index}/documents"))
+            .header("Authorization", format!("Bearer {API_KEY}"))
+            .header("Content-Type", "application/json")
+            .body(serde_json::json!([{"id": 2, "title": "Solaris"}]).to_string())
+            .send()
+            .await
+            .expect("enqueue a parent without waiting for it");
+        assert!(queued.status().is_success());
         let sent = child
             .send_batch(vec![
                 CanonicalMessage::from(serde_json::json!({"id": 1, "rating": 8}).to_string()),
-                CanonicalMessage::from(serde_json::json!({"id": 2, "rating": 5}).to_string()),
+                CanonicalMessage::from(serde_json::json!({"id": 2, "rating": 7}).to_string()),
+                CanonicalMessage::from(serde_json::json!({"id": 3, "rating": 5}).to_string()),
             ])
             .await
-            .expect("publish two child rows");
+            .expect("publish three child rows");
         assert!(
             matches!(sent, SentBatch::Ack),
             "a skipped row is acknowledged"
@@ -256,9 +267,17 @@ async fn update_existing_skips_documents_that_do_not_exist() {
             .await
             .expect("create Meilisearch consumer");
         let documents = read_all(&mut *consumer).await;
-        assert_eq!(ids(&documents), vec![1]);
-        assert_eq!(documents[0]["title"], "Stalker");
-        assert_eq!(documents[0]["rating"], 8);
+        assert_eq!(ids(&documents), vec![1, 2]);
+        let by_id = |id: u64| {
+            documents
+                .iter()
+                .find(|document| document["id"] == id)
+                .unwrap()
+        };
+        assert_eq!(by_id(1)["title"], "Stalker");
+        assert_eq!(by_id(1)["rating"], 8);
+        assert_eq!(by_id(2)["title"], "Solaris");
+        assert_eq!(by_id(2)["rating"], 7);
     })
     .await;
 }

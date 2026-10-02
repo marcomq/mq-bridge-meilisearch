@@ -24,8 +24,8 @@ pub enum WriteMethod {
 impl WriteMethod {
     const ALL: [Self; 3] = [Self::Replace, Self::Update, Self::UpdateExisting];
 
-    /// The spelling `rename_all = "lowercase"` gives each variant. Exhaustive,
-    /// so a new variant cannot reach the schema unnamed.
+    /// The spelling serde gives each variant. Exhaustive, so a new variant
+    /// cannot reach the schema unnamed.
     fn as_str(self) -> &'static str {
         match self {
             WriteMethod::Replace => "replace",
@@ -236,8 +236,7 @@ pub(crate) fn resolve(
                 "Meilisearch `primary_key` is required with `method: update_existing`, so each document can be looked up before it is written"
             ));
         }
-        // An earlier delete run of the same batch is enqueued but not yet
-        // applied when the existence check runs, so it could not see it.
+        // A route that only adds to a document must not delete it.
         if config.operation.is_some() {
             return Err(anyhow!(
                 "Meilisearch `method: update_existing` cannot be combined with `operation`: map `operation` on the route that owns the document instead"

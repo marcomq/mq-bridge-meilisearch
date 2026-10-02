@@ -312,11 +312,14 @@ document holding only those fields.
 
 **`method: update_existing` prevents those stubs** (0.1.3+). Use it on the routes that
 only add to a document (`movie_stats` above), not on the one that owns it.
-Before each write it asks Meilisearch which of the batch's documents exist
-(`POST /documents/fetch`, Meilisearch 1.14+), merges into those and
-acknowledges the rest unwritten. It needs `primary_key` and cannot be combined
-with `operation`. A parent delete still queued in Meilisearch when the check runs
-is not seen yet, so the window shrinks to the indexing delay rather than closing.
+Before each write it waits for the writes already queued on the index, so a
+parent another route just created or deleted is seen, then asks Meilisearch
+which of the batch's documents exist (`POST /documents/fetch`, Meilisearch
+1.14+), merges into those and acknowledges the rest unwritten. The wait ties
+the route's pace to the index's indexing speed. It needs `primary_key` and
+cannot be combined with `operation`. One gap remains: a parent row read
+before its child committed but written to Meilisearch after the check misses
+that child until the child changes again.
 
 ## Composite primary keys
 
