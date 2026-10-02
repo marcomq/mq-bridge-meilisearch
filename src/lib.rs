@@ -25,7 +25,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use mq_bridge::traits::{CustomEndpointFactory, MessageConsumer, MessagePublisher};
 
-pub use config::{MeilisearchConfig, WriteMethod};
+pub use config::{Compression, MeilisearchConfig, WriteMethod};
 
 #[derive(Debug, Default)]
 pub struct MeilisearchFactory;
