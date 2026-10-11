@@ -36,12 +36,15 @@ output:
 | `index` | both | route name | Index UID. On an output, may contain templates. |
 | `primary_key` | both | none | The field Meilisearch keys documents by. |
 | `method` | output | `replace` | `replace` overwrites a document; `update` merges top-level fields into it; `update_existing` merges only into a document that already exists. |
+| `update_where` | output | none | `<attribute> = <value>`, e.g. `author.id = ${payload:id}`: write each message into the documents it matches instead of indexing it. See [Merging rows](#merging-rows-from-different-tables). |
+| `update_into` | output | none | The top-level field `update_where` writes the message to. |
 | `operation` | output | none | Each message's change operation, e.g. `${metadata:postgres.operation}`. |
 | `delete_values` | output | `["delete"]` | Operation values that mean "remove this document". |
 | `create_index` | output | `true` | Create the index before the first write. |
+| `swap_into` | output | none | The live index a rebuild replaces: once the input is drained, `index` is swapped with it and deleted. See [Rebuilding an index](#rebuilding-an-index). |
 | `settings` | output | none | Index settings, forwarded verbatim to `PATCH /indexes/{uid}/settings`. |
 | `wait_for_task` | output | `true` | Wait for the indexing task to finish before acknowledging. |
-| `task_timeout_ms` | output | `60000` | How long to wait for one task. |
+| `task_timeout_ms` | output | `60000` | How long one task may take before a warning is logged. The wait continues; a slow task is never resent. |
 | `max_request_bytes` | output | `90000000` | Split a batch into several requests rather than exceed this body size. |
 | `compression` | output | `none` | `gzip` compresses document request bodies (`Content-Encoding: gzip`). `max_request_bytes` still counts uncompressed bytes, which is what Meilisearch's payload limit applies to. |
 | `connect_timeout_ms` | both | `10000` | TCP/TLS connect timeout. |
@@ -110,7 +113,50 @@ settings:
 The body is passed through untouched, so anything Meilisearch accepts works,
 including settings added after this release. `PATCH` merges, so keys you leave
 out keep their current value, and a key Meilisearch rejects fails the route at
-startup instead of being dropped silently.
+startup instead of being dropped silently. The route starts only once that
+settings task has finished, so on an index that already holds documents a
+changed setting delays the start by the reindex it causes.
+
+Declare `searchableAttributes`, `filterableAttributes` and `embedders` here
+**before the first load**. Meilisearch indexes every field as searchable until
+told otherwise, and changing any of the three later reindexes every document
+already stored.
+
+Vectors computed upstream go in `_vectors`, under an embedder declared as
+`userProvided`:
+
+```yaml
+output:
+  middlewares:
+    - transform:
+        mapping:
+          id: "$.id"
+          title: "$.title"
+          "_vectors.default": "$.embedding"
+        schema:
+          type: object
+          properties:
+            _vectors:
+              type: object
+              properties:
+                default:
+                  type: ["string", "null"]
+                  contentMediaType: application/json
+  custom:
+    name: meilisearch
+    config:
+      url: "http://localhost:7700"
+      index: "movies"
+      primary_key: "id"
+      settings:
+        embedders:
+          default: { source: userProvided, dimensions: 384 }
+```
+
+The `schema` is only needed when the vector arrives as a JSON string, as a
+`jsonb` or array column does from a backfill: `contentMediaType` parses it into
+the array Meilisearch expects, and `null` is allowed so that a delete, which
+carries the key and nothing else, is not rejected by the transform.
 
 ### Delivery
 
@@ -122,7 +168,16 @@ segment, and segments are issued in order. Without `primary_key` documents
 cannot be told apart, and every switch starts one. A failing request fails its
 messages and every later segment, so the route never sees an unconfirmed write
 reported as delivered. A request over `max_request_bytes` is split into several
-ordered ones rather than rejected as `payload_too_large`.
+ordered ones rather than rejected as `payload_too_large`. Meilisearch itself
+recommends 50,000 to 100,000 documents per request for a bulk load, so raise
+`batch_size` for a backfill rather than sending many small batches.
+
+`mqb copy` (mq-bridge 0.4.18+) does that by itself: with no `--batch-size` it
+uses the 50,000 this endpoint asks for. A route in a config file keeps its own
+`batch_size`. The batch is held in memory, so size it to the documents: 50,000
+small rows took 200 to 280 MB in our runs, while a row carrying a
+1,024-dimension vector is about 46 KB, over 2 GB per batch. Pass a smaller
+`--batch-size` for documents like that.
 
 Meilisearch fails a whole request for one bad document, so documents it would
 refuse — no `primary_key` field, an invalid id, a payload that is not a JSON
@@ -133,6 +188,19 @@ Meilisearch answers a write with `202 Accepted` and applies it afterwards, so
 Otherwise the source's replication slot advances past writes that can still fail
 (an invalid `_geo`, for one), losing rows silently. That is one round trip per
 batch — negligible at `batch_size: 1000`.
+
+The wait has no upper bound. Meilisearch does not lose an enqueued task, so a
+batch whose task is merely slow is never handed back to `retry`: resending it
+would index the same documents a second time behind the first. Each
+`task_timeout_ms` that passes logs a warning instead, and a poll that fails
+(Meilisearch restarting, a `503`) is repeated. The batch fails only when the
+task itself finishes as `failed` or `canceled`.
+
+One resend remains possible: a documents request that times out before its
+`202` arrives — `request_timeout_ms`, a proxy, or a `timeout` middleware around
+the sink — may already be enqueued, and the retry enqueues it again. With
+`primary_key` set that costs indexing time but changes nothing: both writes
+carry the same documents under the same keys.
 
 ### Ordering and `concurrency`
 
@@ -295,10 +363,56 @@ stats, and a second route follows later `book_stats` changes with
 `update_existing`. Two things `lookup` does not do:
 
 - **A parent change does not reach its children.** Renaming an author leaves
-  existing books with the old name until each book is written again.
+  existing books with the old name; a second route with `update_where`, below,
+  pushes the change into them.
 - **It answers with one row.** A one-to-many child, such as a book's genres,
   still has to be built upstream; a list replaces the whole field (see
   [Limitations](#limitations)).
+
+**`update_where` pushes a parent change into its children** (0.1.3+). A route on the
+parent table writes each changed row into every document that embeds it:
+
+```yaml
+routes:
+  authors_to_books:
+    input:
+      postgres_cdc:
+        url: "postgres://user:pass@localhost/app"
+        publication: "authors_pub"
+    output:
+      middlewares:
+        - transform:
+            mapping: { id: "$.id", name: "$.name" }
+      custom:
+        name: meilisearch
+        config:
+          url: "http://localhost:7700"
+          index: "books"
+          primary_key: "id"
+          update_where: "author.id = ${payload:id}"
+          update_into: author
+```
+
+For each message the sink asks Meilisearch for the ids of the documents where
+`author.id` equals the message's `id` (`POST /documents/fetch` with a filter,
+Meilisearch 1.14+), then merges `{"id": <book id>, "author": <message>}` into
+each of them, split by `max_request_bytes`. The message replaces the `author`
+field whole, so shape it with a `transform` into what the `lookup` wrote. A row
+no document refers to is acknowledged without a write.
+
+- The attribute must be in the index's `filterableAttributes`; otherwise
+  Meilisearch refuses the filter and the message is dead-lettered.
+- Only equality is supported. The sink quotes the value itself, so a value read
+  from a message cannot widen the filter.
+- The route never deletes: it takes no `operation`, and a parent row's delete
+  arrives as one more row to write. Drop deletes with a `filter` middleware, or
+  let the foreign key decide what happens to the children at the source.
+- A change costs one write per matching document, so a parent with a million
+  children is a million updates. Before each batch the route waits for the
+  writes already queued on the index, as `update_existing` does.
+- One gap remains: a child written by the other route with a `lookup` that read
+  the parent just before the change, and indexed just after this route matched,
+  keeps the old value until either row changes again.
 
 **Deletes remove the whole document.** With `operation` mapped, deleting a
 `movie_stats` row deletes the movie, not just its rating. Map `operation` only
@@ -366,17 +480,42 @@ route once more with a new `slot_name` and `checkpoint_store` and
 `consume: capture_all`, then drop the old slot with
 `SELECT pg_drop_replication_slot('…')` — it retains WAL until dropped.
 
-**Without downtime,** build the new version under another name and swap it in.
-Searches keep hitting the old index until the swap, which is atomic:
+**Without downtime,** build the new version under another name and let
+`swap_into` put it live (0.1.3+, mq-bridge 0.4.18+). Searches keep hitting the
+old index until the swap, which is atomic:
 
 1. Stop the streaming route. Its slot keeps the changes that arrive meanwhile.
-2. Copy the settings: `GET /indexes/movies/settings`, then `PATCH` them onto
-   `movies_v2`, or set `settings` on the rebuilding endpoint.
-3. Rebuild into `movies_v2` with the command above (`index=movies_v2`).
-4. `POST /swap-indexes` with `[{"indexes": ["movies", "movies_v2"]}]`, then
-   `DELETE /indexes/movies_v2`, which now holds the old documents.
-5. Start the streaming route again. It replays the changes from step 1 into the
+2. Rebuild into another index, naming the live one in `swap_into`. Give the
+   rebuilding endpoint the index's `settings`: a new index starts without them.
+
+   ```console
+   mq-bridge-app copy --drain \
+     'postgres://user:pass@localhost/app?table=movies&cursor_column=id' \
+     'meilisearch://localhost:7700?index=movies_v2&swap_into=movies&primary_key=id&api_key=…'
+   ```
+
+3. Start the streaming route again. It replays the changes from step 1 into the
    rebuilt index.
+
+When the route has drained its input, the endpoint swaps `movies_v2` with
+`movies` (`POST /swap-indexes`) and deletes `movies_v2`, which then holds the
+old documents. It swaps only when all of this holds, and otherwise logs a
+warning and leaves `movies` untouched:
+
+- the input was read to its end — a route that was stopped, or failed, has
+  built only part of the index;
+- every document was written — one that was refused or dead-lettered blocks the
+  swap, since the new index would be missing it, while one that failed and was
+  then written by a `retry` does not;
+- at least one document was written, so an empty source cannot blank the live
+  index.
+
+A swap that is skipped or fails **does not fail the route**: mq-bridge only
+logs an error raised while a route shuts down, so `copy --drain` still exits
+`0`. Check the log for "is now live" before relying on it. Under a host older
+than mq-bridge 0.4.18, which does not tell a plugin how the route ended, the
+swap is always skipped; do it by hand with `POST /swap-indexes` and
+`[{"indexes": ["movies", "movies_v2"]}]`, then `DELETE /indexes/movies_v2`.
 
 ## Reading an index back out
 
@@ -417,8 +556,20 @@ mqb copy --plugin ./libmq_bridge_meilisearch.so 'file://movies.jsonl?format=raw'
 mq_bridge::plugin::load_endpoint_plugin("./libmq_bridge_meilisearch.so")?;
 ```
 
-The library speaks plugin ABI 1.1, so the host must be mq-bridge 0.4.13 or
-newer. A URI query carries no types, so the host maps one against the schema
+`--plugin` only works on a host that does not already have the endpoint. The
+`mqb` CLI ships with a copy built in (0.1.2 in mqb 0.4.17) and refuses a second
+one named on the command line as "already registered". To run a newer build
+there, point the plugin search path at it and ask for the replacement:
+
+```console
+MQB_PLUGIN_DIR=./target/release MQB_PLUGIN_OVERRIDE=meilisearch mqb copy -v …
+```
+
+With `-v` the log confirms it: "using the installed `meilisearch` plugin …
+instead of the built-in copy".
+
+The library is built against plugin ABI 1.3 and loads in mq-bridge 0.4.13 or
+newer; `swap_into` is the one feature that needs a 0.4.18 host. A URI query carries no types, so the host maps one against the schema
 this endpoint declares: `create_index=false`, `task_timeout_ms=30000` and
 `delete_values=delete,remove` reach the endpoint as a boolean, a number and a
 list.
@@ -449,9 +600,10 @@ for how loading, versioning and the ABI work, and
 Version 0.1 passes its suite against a real Meilisearch but has no production
 mileage — run it beside whatever you have now before cutting over.
 
-- **Joined fields go stale when the parent changes.** A `lookup` reads the
-  referenced row when the child is written; a later change to that row is not
-  pushed into existing documents. See [Merging rows](#merging-rows-from-different-tables).
+- **Joined fields go stale when the parent changes, unless a route pushes the
+  change.** A `lookup` reads the referenced row when the child is written; a
+  later change to that row reaches existing documents only through a second
+  route with `update_where`. See [Merging rows](#merging-rows-from-different-tables).
 - **`update` merges top-level fields only**: `{"tags": ["a"]}` replaces the whole
   array. Meilisearch's function-based edit applies to a filtered document set
   rather than one document per message, so it does not fit this sink. Compute

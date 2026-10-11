@@ -1,6 +1,7 @@
 use std::{
     any::Any,
     collections::{HashMap, HashSet},
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 use anyhow::{anyhow, Context};
@@ -8,7 +9,7 @@ use async_trait::async_trait;
 use mq_bridge::{
     errors::{InvalidConfig, PublisherError},
     support::interpolation::CompiledTemplate,
-    traits::{EndpointStatus, MessagePublisher},
+    traits::{disconnect_outcome, BoxFuture, DisconnectOutcome, EndpointStatus, MessagePublisher},
     CanonicalMessage, SentBatch,
 };
 
@@ -57,6 +58,8 @@ struct Run {
 #[derive(Debug, Default)]
 struct Plan {
     runs: Vec<Run>,
+    /// Each message's document id, read once here for the steps that need it.
+    ids: Vec<Option<serde_json::Value>>,
     rejected: Vec<(usize, anyhow::Error)>,
     stopped: Option<(usize, anyhow::Error)>,
 }
@@ -96,19 +99,9 @@ impl RunFailure {
 impl From<MeiliError> for RunFailure {
     fn from(error: MeiliError) -> Self {
         Self {
-            retryable: is_retryable(&error),
+            retryable: error.is_retryable(),
             reason: describe(&error),
         }
-    }
-}
-
-/// Which Meilisearch failures can heal on their own. A rejected key or a
-/// malformed document cannot, and retrying it would only delay the dead letter.
-fn is_retryable(error: &MeiliError) -> bool {
-    match error {
-        MeiliError::Transport(_) => true,
-        MeiliError::Status { status, .. } => matches!(status, 429 | 500 | 502 | 503 | 504),
-        MeiliError::Task { .. } => false,
     }
 }
 
@@ -127,11 +120,39 @@ fn resolve(template: &CompiledTemplate, message: &CanonicalMessage) -> Option<St
     String::from_utf8(template.render_resolved(Some(message))?).ok()
 }
 
-fn payload_field(message: &CanonicalMessage, field: &str) -> Option<serde_json::Value> {
-    serde_json::from_slice::<serde_json::Value>(&message.payload)
-        .ok()?
-        .get(field)
-        .cloned()
+/// Reads one top-level field of a JSON object and skips every other value
+/// unparsed, so a document carrying a large vector costs no allocation per
+/// number. Fails when the payload is not one valid JSON object.
+fn top_level_field(payload: &[u8], field: &str) -> serde_json::Result<Option<serde_json::Value>> {
+    struct FieldOf<'a>(&'a str);
+
+    impl<'de> serde::de::Visitor<'de> for FieldOf<'_> {
+        type Value = Option<serde_json::Value>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a JSON object")
+        }
+
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            mut map: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut found = None;
+            while let Some(key) = map.next_key::<std::borrow::Cow<'de, str>>()? {
+                if key == self.0 {
+                    found = Some(map.next_value()?);
+                } else {
+                    map.next_value::<serde::de::IgnoredAny>()?;
+                }
+            }
+            Ok(found)
+        }
+    }
+
+    let mut deserializer = serde_json::Deserializer::from_slice(payload);
+    let found = serde::Deserializer::deserialize_map(&mut deserializer, FieldOf(field))?;
+    deserializer.end()?;
+    Ok(found)
 }
 
 fn stringify(value: serde_json::Value) -> String {
@@ -163,28 +184,38 @@ fn append_document(body: &mut Vec<u8>, message: &CanonicalMessage) -> anyhow::Re
     Ok(())
 }
 
-/// Frames messages as NDJSON request bodies, starting a new one whenever the
-/// current body would grow past `max_bytes`. A single document larger than the
-/// limit is still sent on its own: splitting it is impossible, and Meilisearch
-/// naming the payload limit beats this endpoint guessing at the cause.
-fn chunk_documents<'a>(
-    messages: impl IntoIterator<Item = &'a CanonicalMessage>,
+/// Frames messages as NDJSON request bodies one at a time, so a batch is never
+/// held a second time as bodies waiting to be sent. A new body starts whenever
+/// the current one would grow past `max_bytes`. A single document larger than
+/// the limit is still sent on its own: splitting it is impossible, and
+/// Meilisearch naming the payload limit beats this endpoint guessing at the cause.
+struct DocumentChunks<I> {
+    messages: I,
+    carried: Vec<u8>,
     max_bytes: usize,
-) -> anyhow::Result<Vec<Vec<u8>>> {
-    let mut bodies: Vec<Vec<u8>> = Vec::new();
-    let mut body = Vec::new();
-    for message in messages {
-        let mark = body.len();
-        append_document(&mut body, message)?;
-        if mark > 0 && body.len() > max_bytes {
-            let carried = body.split_off(mark);
-            bodies.push(std::mem::replace(&mut body, carried));
+}
+
+impl<'a, I: Iterator<Item = &'a CanonicalMessage>> DocumentChunks<I> {
+    fn new(messages: impl IntoIterator<IntoIter = I>, max_bytes: usize) -> Self {
+        Self {
+            messages: messages.into_iter(),
+            carried: Vec::new(),
+            max_bytes,
         }
     }
-    if !body.is_empty() {
-        bodies.push(body);
+
+    fn next_body(&mut self) -> anyhow::Result<Option<Vec<u8>>> {
+        let mut body = std::mem::take(&mut self.carried);
+        for message in self.messages.by_ref() {
+            let mark = body.len();
+            append_document(&mut body, message)?;
+            if mark > 0 && body.len() > self.max_bytes {
+                self.carried = body.split_off(mark);
+                return Ok(Some(body));
+            }
+        }
+        Ok(Some(body).filter(|body| !body.is_empty()))
     }
-    Ok(bodies)
 }
 
 /// Decides, per message, what goes back to the route. `outcomes` covers a
@@ -249,6 +280,84 @@ fn report(messages: Vec<CanonicalMessage>, failures: Vec<Option<RunFailure>>) ->
     SentBatch::from_failures(failed)
 }
 
+/// `update_where`, compiled: each message patches the documents whose
+/// `attribute` equals `value` by writing itself to their `into` field.
+struct UpdateWhere {
+    attribute: String,
+    value: CompiledTemplate,
+    into: String,
+}
+
+/// What this publisher's route pass has done so far, which decides whether the
+/// index it built may replace the live one.
+#[derive(Default)]
+struct Pass {
+    written: AtomicBool,
+    refused: AtomicBool,
+    /// Documents handed back to be retried and not written since.
+    unwritten: std::sync::Mutex<HashSet<String>>,
+}
+
+impl Pass {
+    /// A retried document that then succeeds no longer counts against the
+    /// swap; one refused for good, or failing without an id to follow, does.
+    fn record(&self, ids: &[Option<serde_json::Value>], failures: &[Option<RunFailure>]) {
+        self.written.store(true, Ordering::Relaxed);
+        let mut unwritten = self
+            .unwritten
+            .lock()
+            .unwrap_or_else(|lock| lock.into_inner());
+        for (position, failure) in failures.iter().enumerate() {
+            let id = ids
+                .get(position)
+                .and_then(Option::as_ref)
+                .map(|id| id.to_string());
+            match (failure, id) {
+                (None, Some(id)) => {
+                    unwritten.remove(&id);
+                }
+                (None, None) => {}
+                (Some(failure), Some(id)) if failure.retryable => {
+                    unwritten.insert(id);
+                }
+                (Some(_), _) => self.refused.store(true, Ordering::Relaxed),
+            }
+        }
+    }
+
+    /// Why the built index must not go live, or `None` when it may. Only a
+    /// route that drained its input to the end has built the whole index, and
+    /// a host older than mq-bridge 0.4.18 reports no outcome at all.
+    fn objection(&self, outcome: Option<DisconnectOutcome>) -> Option<&'static str> {
+        match outcome {
+            Some(DisconnectOutcome::Completed) => {}
+            Some(DisconnectOutcome::Failed) => return Some("the route ended with an error"),
+            Some(DisconnectOutcome::Stopped) => {
+                return Some("the route was stopped before its input was drained")
+            }
+            None => {
+                return Some(
+                    "the host does not report how the route ended (mq-bridge 0.4.18+ does)",
+                )
+            }
+        }
+        let unwritten = self
+            .unwritten
+            .lock()
+            .unwrap_or_else(|lock| lock.into_inner());
+        if self.refused.load(Ordering::Relaxed) || !unwritten.is_empty() {
+            return Some("at least one document could not be written");
+        }
+        if !self.written.load(Ordering::Relaxed) {
+            return Some("nothing was written, and an empty index would replace the live one");
+        }
+        None
+    }
+}
+
+/// How many matching document ids one page of an `update_where` lookup reads.
+const PATCH_PAGE: usize = 1_000;
+
 struct MeilisearchPublisher {
     client: MeiliClient,
     /// The configured index, as written.
@@ -263,6 +372,9 @@ struct MeilisearchPublisher {
     max_request_bytes: usize,
     create_index: bool,
     settings: Option<serde_json::Map<String, serde_json::Value>>,
+    update_where: Option<UpdateWhere>,
+    swap_into: Option<String>,
+    pass: Pass,
     /// Indexes this publisher has already created, so a routed batch pays for
     /// the check once per index rather than once per run.
     known_indexes: Mutex<HashSet<String>>,
@@ -334,15 +446,14 @@ impl MeilisearchPublisher {
     /// Issues one upsert run, as several requests when the NDJSON body would
     /// exceed `max_request_bytes`. The chunks go out in source order, so an
     /// earlier document can never land after a later one.
-    async fn send_documents<'a>(
-        &self,
-        index: &str,
-        messages: impl IntoIterator<Item = &'a CanonicalMessage>,
-    ) -> Result<Vec<u64>, RunFailure> {
-        let bodies =
-            chunk_documents(messages, self.max_request_bytes).map_err(RunFailure::permanent)?;
-        let mut tasks = Vec::with_capacity(bodies.len());
-        for body in bodies {
+    async fn send_documents<'a, I>(&self, index: &str, messages: I) -> Result<Vec<u64>, RunFailure>
+    where
+        I: IntoIterator<Item = &'a CanonicalMessage>,
+        I::IntoIter: Send,
+    {
+        let mut chunks = DocumentChunks::new(messages, self.max_request_bytes);
+        let mut tasks = Vec::new();
+        while let Some(body) = chunks.next_body().map_err(RunFailure::permanent)? {
             tasks.push(
                 self.client
                     .add_documents(index, self.primary_key.as_deref(), self.method, body)
@@ -352,36 +463,38 @@ impl MeilisearchPublisher {
         Ok(tasks)
     }
 
-    /// The document a message writes, when it can be told: without a configured
-    /// `primary_key` Meilisearch infers the key, so the plan must assume any two
-    /// messages may touch the same document. A document Meilisearch would
-    /// refuse is rejected here, so it cannot fail the task of the others in its run.
-    fn document_key(&self, message: &CanonicalMessage) -> anyhow::Result<Option<String>> {
-        let Some(key) = self.primary_key.as_deref() else {
+    /// The id of the document a message writes, when it can be told: without a
+    /// configured `primary_key` Meilisearch infers the key, so the plan must
+    /// assume any two messages may touch the same document. A document
+    /// Meilisearch would refuse is rejected here, so it cannot fail the task of
+    /// the others in its run.
+    fn document_id(&self, message: &CanonicalMessage) -> anyhow::Result<Option<serde_json::Value>> {
+        let key = self.primary_key.as_deref();
+        let value = top_level_field(&message.payload, key.unwrap_or_default()).map_err(|_| {
+            anyhow!("Meilisearch stores JSON objects; this message's payload is not one. Use a `transform` middleware to shape it before the sink.")
+        })?;
+        let Some(key) = key else {
             return Ok(None);
         };
-        let document = serde_json::from_slice::<serde_json::Value>(&message.payload)
-            .ok()
-            .filter(serde_json::Value::is_object)
-            .ok_or_else(|| {
-                anyhow!("Meilisearch stores JSON objects; this message's payload is not one. Use a `transform` middleware to shape it before the sink.")
-            })?;
-        let value = document.get(key).ok_or_else(|| {
+        let value = value.ok_or_else(|| {
             anyhow!("the document carries no `{key}` field, so Meilisearch cannot tell which document it is")
         })?;
-        if !is_valid_document_id(value) {
+        if !is_valid_document_id(&value) {
             return Err(anyhow!(
                 "`{key}` {value} is not a valid Meilisearch document id: use an integer, or a string of at most 511 bytes of a-z A-Z 0-9 - _"
             ));
         }
-        Ok(Some(stringify(value.clone())))
+        Ok(Some(value))
     }
 
     /// Groups the batch into segments of runs (see [`Run`]), setting aside
     /// documents Meilisearch would refuse and stopping at the first message
     /// that cannot be placed.
     fn plan(&self, messages: &[CanonicalMessage]) -> Plan {
-        let mut plan = Plan::default();
+        let mut plan = Plan {
+            ids: vec![None; messages.len()],
+            ..Plan::default()
+        };
         let runs = &mut plan.runs;
         let mut segment = 0;
         let mut segment_start = 0;
@@ -398,8 +511,12 @@ impl MeilisearchPublisher {
                     return plan;
                 }
             };
-            let key = match self.document_key(message) {
-                Ok(key) => key,
+            let key = match self.document_id(message) {
+                Ok(id) => {
+                    let key = id.clone().map(stringify);
+                    plan.ids[position] = id;
+                    key
+                }
                 Err(error) => {
                     plan.rejected.push((position, error));
                     continue;
@@ -445,48 +562,45 @@ impl MeilisearchPublisher {
         plan
     }
 
-    fn delete_ids<'a>(
+    /// The ids a delete run removes, as read by the plan.
+    fn delete_ids(
         &self,
-        messages: impl IntoIterator<Item = &'a CanonicalMessage>,
+        positions: &[usize],
+        ids: &[Option<serde_json::Value>],
     ) -> anyhow::Result<Vec<serde_json::Value>> {
-        let key = self.primary_key.as_deref().ok_or_else(|| {
-            anyhow!("Meilisearch `primary_key` is required to delete a document by id")
-        })?;
-        messages
-            .into_iter()
-            .map(|message| {
-                payload_field(message, key).ok_or_else(|| {
-                    anyhow!(
-                        "a delete carries no `{key}` field, so the document to remove is unknown"
-                    )
+        if self.primary_key.is_none() {
+            return Err(anyhow!(
+                "Meilisearch `primary_key` is required to delete a document by id"
+            ));
+        }
+        positions
+            .iter()
+            .map(|&position| {
+                ids[position].clone().ok_or_else(|| {
+                    anyhow!("a delete carries no id, so the document to remove is unknown")
                 })
             })
             .collect()
     }
 
-    /// Keeps only the messages whose document already exists in `index`, for
+    /// Keeps only the positions whose document already exists in `index`, for
     /// `update_existing`. Messages dropped here are acknowledged unwritten.
     /// Waits for the index's queued writes first, so a parent another route
     /// just created or deleted is seen.
-    async fn keep_existing<'a>(
+    async fn keep_existing(
         &self,
         index: &str,
-        messages: Vec<&'a CanonicalMessage>,
-    ) -> Result<Vec<&'a CanonicalMessage>, RunFailure> {
+        positions: &[usize],
+        ids: &[Option<serde_json::Value>],
+    ) -> Result<Vec<usize>, RunFailure> {
         let Some(primary_key) = self.primary_key.as_deref() else {
-            return Ok(messages);
+            return Ok(positions.to_vec());
         };
-        if let Some(task) = self.client.latest_pending_task(index).await? {
-            match self.client.wait_for_task(task).await {
-                Ok(()) | Err(MeiliError::Task { .. }) => {}
-                Err(error) => return Err(error.into()),
-            }
-        }
-        let keys = messages
+        self.await_queued_writes(index).await?;
+        let keys: Vec<String> = positions
             .iter()
-            .map(|message| self.document_key(message).map(Option::unwrap_or_default))
-            .collect::<anyhow::Result<Vec<String>>>()
-            .map_err(RunFailure::permanent)?;
+            .map(|&position| ids[position].clone().map(stringify).unwrap_or_default())
+            .collect();
         let mut wanted: Vec<String> = keys
             .iter()
             .cloned()
@@ -499,10 +613,10 @@ impl MeilisearchPublisher {
             let found = self.client.existing_ids(index, primary_key, chunk).await?;
             existing.extend(found.into_iter().map(stringify));
         }
-        let kept: Vec<_> = messages
-            .into_iter()
+        let kept: Vec<_> = positions
+            .iter()
             .zip(keys)
-            .filter_map(|(message, key)| existing.contains(&key).then_some(message))
+            .filter_map(|(&position, key)| existing.contains(&key).then_some(position))
             .collect();
         let skipped = wanted.len() - existing.len();
         if skipped > 0 {
@@ -515,22 +629,208 @@ impl MeilisearchPublisher {
         Ok(kept)
     }
 
+    /// Ends a rebuild: swaps the built index with the live one and deletes
+    /// what is left under the build name, which is then the old documents.
+    async fn swap_in(&self, live: &str) -> Result<(), MeiliError> {
+        if let Some(objection) = self.pass.objection(disconnect_outcome()) {
+            tracing::warn!(
+                "Meilisearch index '{}' was NOT swapped into '{live}': {objection}. '{live}' is unchanged",
+                self.index
+            );
+            return Ok(());
+        }
+        // Meilisearch refuses to swap with an index that does not exist.
+        self.client
+            .create_index(live, self.primary_key.as_deref())
+            .await?;
+        self.client.swap_indexes(&self.index, live).await?;
+        tracing::info!("Meilisearch index '{}' is now live as '{live}'", self.index);
+        self.client.delete_index(&self.index).await?;
+        Ok(())
+    }
+
+    fn reported(
+        &self,
+        messages: Vec<CanonicalMessage>,
+        ids: &[Option<serde_json::Value>],
+        failures: Vec<Option<RunFailure>>,
+    ) -> SentBatch {
+        if self.swap_into.is_some() {
+            self.pass.record(ids, &failures);
+        }
+        report(messages, failures)
+    }
+
+    /// Waits for the writes already queued on `index`, so a read that follows
+    /// sees them. A queued task that fails is its own route's to report.
+    async fn await_queued_writes(&self, index: &str) -> Result<(), MeiliError> {
+        if let Some(task) = self.client.latest_pending_task(index).await? {
+            match self.client.wait_for_task(task).await {
+                Ok(()) | Err(MeiliError::Task { .. }) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    /// What one `update_where` message asks for: the index, the filter naming
+    /// the documents to patch, and the message as one line of JSON.
+    fn patch_of(
+        &self,
+        patch: &UpdateWhere,
+        message: &CanonicalMessage,
+    ) -> anyhow::Result<(String, String, Vec<u8>)> {
+        let index = self.target_index(message)?;
+        let value = resolve(&patch.value, message)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                anyhow!(
+                    "Meilisearch `update_where` resolved to no value for this message, so there is nothing to match `{}` against",
+                    patch.attribute
+                )
+            })?;
+        let filter = format!("{} = {}", patch.attribute, serde_json::Value::String(value));
+        let mut document = Vec::with_capacity(message.payload.len() + 1);
+        append_document(&mut document, message)?;
+        document.pop();
+        top_level_field(&document, "").context("message payload is not valid JSON")?;
+        Ok((index, filter, document))
+    }
+
+    /// Enqueues the updates one `update_where` message causes: its payload
+    /// written to `into` on every document `filter` matches. Only the ids are
+    /// held; the bodies are sent as they fill.
+    async fn issue_patch(
+        &self,
+        into: &str,
+        (index, filter, document): (String, String, Vec<u8>),
+        settled: &mut HashSet<String>,
+    ) -> Result<Vec<u64>, RunFailure> {
+        let key = self.primary_key.as_deref().unwrap_or_default();
+        self.ensure_index(&index).await?;
+        // Documents another route has just enqueued must be matched too.
+        if settled.insert(index.clone()) {
+            self.await_queued_writes(&index).await?;
+        }
+        let (key_json, into_json) = (
+            serde_json::Value::from(key).to_string(),
+            serde_json::Value::from(into).to_string(),
+        );
+        // Every id is read before the first write: an update enqueued while
+        // paging could reorder the pages and hide a document.
+        let mut ids = Vec::new();
+        loop {
+            let page = self
+                .client
+                .matching_ids(&index, key, &filter, ids.len(), PATCH_PAGE)
+                .await?;
+            let read = page.len();
+            ids.extend(page);
+            if read < PATCH_PAGE {
+                break;
+            }
+        }
+        let mut tasks = Vec::new();
+        let mut body = Vec::new();
+        for id in ids {
+            let mark = body.len();
+            body.extend_from_slice(format!("{{{key_json}:{id},{into_json}:").as_bytes());
+            body.extend_from_slice(&document);
+            body.extend_from_slice(b"}\n");
+            if mark > 0 && body.len() > self.max_request_bytes {
+                let carried = body.split_off(mark);
+                let full = std::mem::replace(&mut body, carried);
+                tasks.push(self.send_patch(&index, full).await?);
+            }
+        }
+        if !body.is_empty() {
+            tasks.push(self.send_patch(&index, body).await?);
+        }
+        Ok(tasks)
+    }
+
+    async fn send_patch(&self, index: &str, body: Vec<u8>) -> Result<u64, MeiliError> {
+        self.client
+            .add_documents(
+                index,
+                self.primary_key.as_deref(),
+                WriteMethod::Update,
+                body,
+            )
+            .await
+    }
+
+    /// Applies a batch of `update_where` messages in source order. A message
+    /// that cannot be turned into a patch fails alone; once Meilisearch refuses
+    /// one, it and every later message go back, so two changes to the same
+    /// parent are never applied out of order.
+    async fn patch_batch(
+        &self,
+        patch: &UpdateWhere,
+        messages: &[CanonicalMessage],
+    ) -> Vec<Option<RunFailure>> {
+        let mut failures = vec![None; messages.len()];
+        let mut issued = Vec::with_capacity(messages.len());
+        let mut settled = HashSet::new();
+        for (position, message) in messages.iter().enumerate() {
+            let request = match self.patch_of(patch, message) {
+                Ok(request) => request,
+                Err(error) => {
+                    failures[position] = Some(RunFailure::permanent(error));
+                    continue;
+                }
+            };
+            match self.issue_patch(&patch.into, request, &mut settled).await {
+                Ok(tasks) => issued.push((position, tasks)),
+                Err(failure) => {
+                    issued.push((position, Vec::new()));
+                    failures[position] = Some(failure);
+                    break;
+                }
+            }
+        }
+        let mut first = None;
+        for (position, tasks) in &issued {
+            let outcome = match (&first, &failures[*position]) {
+                (Some(first), _) | (None, Some(first)) => Err(RunFailure::clone(first)),
+                (None, None) => self.confirm(tasks).await,
+            };
+            if let Err(failure) = outcome {
+                failures[*position].get_or_insert_with(|| failure.clone());
+                first.get_or_insert(failure);
+            }
+        }
+        if let (Some(first), Some((last, _))) = (first, issued.last()) {
+            for slot in &mut failures[last + 1..] {
+                slot.get_or_insert_with(|| first.clone());
+            }
+        }
+        failures
+    }
+
     /// Enqueues one run and returns its tasks without waiting for them.
     async fn issue_run(
         &self,
         run: &Run,
         messages: &[CanonicalMessage],
+        ids: &[Option<serde_json::Value>],
     ) -> Result<Vec<u64>, RunFailure> {
         self.ensure_index(&run.index).await?;
-        let selected = run.positions.iter().map(|&position| &messages[position]);
         match run.op {
             Op::Upsert if self.method == WriteMethod::UpdateExisting => {
-                let kept = self.keep_existing(&run.index, selected.collect()).await?;
-                self.send_documents(&run.index, kept).await
+                let kept = self.keep_existing(&run.index, &run.positions, ids).await?;
+                let selected = kept.into_iter().map(|position| &messages[position]);
+                self.send_documents(&run.index, selected).await
             }
-            Op::Upsert => self.send_documents(&run.index, selected).await,
+            Op::Upsert => {
+                let positions = run.positions.iter().copied();
+                let selected = positions.map(|position| &messages[position]);
+                self.send_documents(&run.index, selected).await
+            }
             Op::Delete => {
-                let ids = self.delete_ids(selected).map_err(RunFailure::permanent)?;
+                let ids = self
+                    .delete_ids(&run.positions, ids)
+                    .map_err(RunFailure::permanent)?;
                 Ok(vec![self.client.delete_documents(&run.index, &ids).await?])
             }
         }
@@ -539,9 +839,7 @@ impl MeilisearchPublisher {
     /// Waits for a run's tasks, unless the route opted out of waiting.
     async fn confirm(&self, tasks: &[u64]) -> Result<(), RunFailure> {
         if self.wait_for_task {
-            for task in tasks {
-                self.client.wait_for_task(*task).await?;
-            }
+            self.client.wait_for_tasks(tasks).await?;
         }
         Ok(())
     }
@@ -575,6 +873,18 @@ pub(crate) async fn create(
     let index_template = Some(compile(&index)?).filter(CompiledTemplate::is_dynamic);
     let routed = index_template.is_some();
     let operation = settings.operation.as_deref().map(compile).transpose()?;
+    let update_where = match (&settings.update_where, &settings.update_into) {
+        (Some(condition), Some(into)) => {
+            let (attribute, value) =
+                config::split_update_where(condition).map_err(InvalidConfig)?;
+            Some(UpdateWhere {
+                attribute: attribute.to_owned(),
+                value: compile(value)?,
+                into: into.clone(),
+            })
+        }
+        _ => None,
+    };
     // A routed index is not known until a message names it, so its creation is
     // deferred to the first write instead.
     if settings.create_index && !routed {
@@ -587,7 +897,7 @@ pub(crate) async fn create(
         .await
         {
             let reported = anyhow!("failed to prepare Meilisearch index '{index}': {error}");
-            return Err(if is_retryable(&error) {
+            return Err(if error.is_retryable() {
                 reported
             } else {
                 anyhow::Error::new(PublisherError::NonRetryable(reported))
@@ -606,6 +916,9 @@ pub(crate) async fn create(
         max_request_bytes: settings.max_request_bytes as usize,
         create_index: settings.create_index,
         settings: settings.settings,
+        update_where,
+        swap_into: settings.swap_into,
+        pass: Pass::default(),
         known_indexes: Mutex::default(),
     }))
 }
@@ -619,19 +932,24 @@ impl MessagePublisher for MeilisearchPublisher {
         if messages.is_empty() {
             return Ok(SentBatch::Ack);
         }
+        if let Some(patch) = &self.update_where {
+            let failures = self.patch_batch(patch, &messages).await;
+            return Ok(self.reported(messages, &[], failures));
+        }
 
         // Every run is enqueued before any is awaited: Meilisearch applies an
         // index's tasks in enqueue order and can batch queued tasks together,
         // whereas awaiting each run in turn costs a full indexing round trip per run.
         let Plan {
             runs,
+            ids,
             rejected,
             stopped,
         } = self.plan(&messages);
         let mut issued = Vec::with_capacity(runs.len());
         let mut unissued = None;
         for run in &runs {
-            match self.issue_run(run, &messages).await {
+            match self.issue_run(run, &messages, &ids).await {
                 Ok(tasks) => issued.push(tasks),
                 Err(failure) => {
                     unissued = Some(failure);
@@ -661,7 +979,20 @@ impl MessagePublisher for MeilisearchPublisher {
         for (position, error) in rejected {
             failures[position] = Some(RunFailure::permanent(error));
         }
-        Ok(report(messages, failures))
+        Ok(self.reported(messages, &ids, failures))
+    }
+
+    fn on_disconnect_hook(&self) -> Option<BoxFuture<'_, anyhow::Result<()>>> {
+        let live = self.swap_into.as_deref()?;
+        Some(Box::pin(async move {
+            self.swap_in(live).await.map_err(|error| {
+                let index = &self.index;
+                tracing::error!(
+                    "Meilisearch could not finish swapping '{index}' into '{live}': {error}"
+                );
+                anyhow!("swapping '{index}' into '{live}' failed: {error}")
+            })
+        }))
     }
 
     /// Meilisearch keys documents by primary key, so two batches touching one
@@ -722,6 +1053,9 @@ mod tests {
             max_request_bytes: usize::MAX,
             create_index: true,
             settings: None,
+            update_where: None,
+            swap_into: None,
+            pass: Pass::default(),
             known_indexes: Mutex::default(),
         }
     }
@@ -735,6 +1069,145 @@ mod tests {
                 .insert("postgres.operation".to_owned(), operation.to_owned());
         }
         message
+    }
+
+    /// A Meilisearch whose `movies` index holds two documents by author 5, and
+    /// the request lines it was sent.
+    async fn meilisearch_with_two_matches(
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = requests.clone();
+        let url = crate::client::stub::serve(move |request| {
+            seen.lock().unwrap().push(request.to_owned());
+            if request.starts_with("POST /indexes/movies/documents/fetch") {
+                (
+                    200,
+                    r#"{"results":[{"id":1},{"id":2}],"total":2}"#.to_owned(),
+                )
+            } else if request.starts_with("PUT /indexes/movies/documents") {
+                (202, r#"{"taskUid":7}"#.to_owned())
+            } else if request.starts_with("GET /tasks?") {
+                (200, r#"{"results":[]}"#.to_owned())
+            } else {
+                (200, r#"{"uid":7,"status":"succeeded"}"#.to_owned())
+            }
+        })
+        .await;
+        (url, requests)
+    }
+
+    async fn patching_publisher(url: &str) -> Box<dyn MessagePublisher> {
+        create(
+            "movies",
+            &serde_json::json!({
+                "url": url,
+                "index": "movies",
+                "primary_key": "id",
+                "create_index": false,
+                "update_where": "author.id = ${payload:id}",
+                "update_into": "author",
+            }),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn update_where_merges_the_message_into_the_documents_it_matches() {
+        let (url, requests) = meilisearch_with_two_matches().await;
+        let publisher = patching_publisher(&url).await;
+
+        let author = CanonicalMessage::from(r#"{"id":5,"name":"Lem"}"#.to_owned());
+        let sent = publisher.send_batch(vec![author]).await.unwrap();
+
+        assert!(matches!(sent, SentBatch::Ack));
+        let requests = requests.lock().unwrap();
+        let writes: Vec<_> = requests
+            .iter()
+            .filter(|request| !request.starts_with("GET") && !request.contains("/fetch"))
+            .collect();
+        assert_eq!(
+            writes.len(),
+            1,
+            "both matches travel in one body: {requests:?}"
+        );
+        assert!(writes[0].starts_with("PUT /indexes/movies/documents"));
+    }
+
+    #[tokio::test]
+    async fn an_update_where_message_without_the_matched_value_fails_alone() {
+        let (url, _) = meilisearch_with_two_matches().await;
+        let publisher = patching_publisher(&url).await;
+
+        let nameless = CanonicalMessage::from(r#"{"name":"Lem"}"#.to_owned());
+        let author = CanonicalMessage::from(r#"{"id":5,"name":"Lem"}"#.to_owned());
+        let sent = publisher.send_batch(vec![nameless, author]).await.unwrap();
+
+        let SentBatch::Partial { failed, .. } = sent else {
+            panic!("the message naming no author must be handed back");
+        };
+        assert_eq!(failed.len(), 1);
+        assert!(matches!(failed[0].1, PublisherError::NonRetryable(_)));
+    }
+
+    #[test]
+    fn the_update_where_value_is_quoted_so_it_cannot_widen_the_filter() {
+        let publisher = publisher(None);
+        let patch = UpdateWhere {
+            attribute: "author.id".to_owned(),
+            value: template("${payload:id}"),
+            into: "author".to_owned(),
+        };
+        let hostile = CanonicalMessage::from(
+            serde_json::json!({"id": "5\" OR id EXISTS OR x = \"", "name": "Lem"}).to_string(),
+        );
+
+        let (_, filter, document) = publisher.patch_of(&patch, &hostile).unwrap();
+
+        assert_eq!(filter, r#"author.id = "5\" OR id EXISTS OR x = \"""#);
+        assert!(!document.contains(&b'\n'));
+    }
+
+    #[test]
+    fn only_a_drained_route_that_wrote_without_failures_may_swap() {
+        use DisconnectOutcome::{Completed, Failed, Stopped};
+        let failure = || Some(RunFailure::permanent(anyhow!("refused")));
+
+        let retry = || {
+            let retryable = true;
+            let reason = "busy".to_owned();
+            Some(RunFailure { retryable, reason })
+        };
+        let ids = [Some(serde_json::json!(1)), Some(serde_json::json!(2))];
+
+        let pass = Pass::default();
+        assert!(pass.objection(Some(Completed)).is_some(), "nothing written");
+        pass.record(&ids, &[None, None]);
+        assert!(pass.objection(Some(Completed)).is_none());
+        assert!(pass.objection(Some(Stopped)).is_some());
+        assert!(pass.objection(Some(Failed)).is_some());
+        assert!(
+            pass.objection(None).is_some(),
+            "a host that reports nothing"
+        );
+
+        pass.record(&ids, &[None, retry()]);
+        assert!(
+            pass.objection(Some(Completed)).is_some(),
+            "document 2 is missing"
+        );
+        pass.record(&ids[1..], &[None]);
+        assert!(
+            pass.objection(Some(Completed)).is_none(),
+            "the retry wrote it"
+        );
+
+        pass.record(&ids, &[None, failure()]);
+        pass.record(&ids, &[None, None]);
+        assert!(
+            pass.objection(Some(Completed)).is_some(),
+            "a refusal sticks"
+        );
     }
 
     #[test]
@@ -869,11 +1342,53 @@ mod tests {
     #[test]
     fn a_delete_names_the_document_by_its_primary_key() {
         let publisher = publisher(Some("${metadata:postgres.operation}"));
-        let ids = publisher.delete_ids(&[message(7, Some("delete"))]).unwrap();
+        let plan = publisher.plan(&[message(7, Some("delete"))]);
+        let ids = publisher.delete_ids(&[0], &plan.ids).unwrap();
         assert_eq!(ids, vec![serde_json::json!(7)]);
 
         let without_key = CanonicalMessage::from(r#"{"title":"x"}"#);
-        assert!(publisher.delete_ids(&[without_key]).is_err());
+        let plan = publisher.plan(&[without_key]);
+        assert_eq!(plan.rejected.len(), 1);
+        assert!(publisher.delete_ids(&[0], &plan.ids).is_err());
+    }
+
+    #[test]
+    fn the_id_is_read_without_parsing_the_rest_of_the_document() {
+        let document = br#"{"title":"x","_vectors":{"default":[0.1,0.2]},"id":7,"tags":["a"]}"#;
+        assert_eq!(
+            top_level_field(document, "id").unwrap(),
+            Some(serde_json::json!(7))
+        );
+        assert_eq!(top_level_field(document, "default").unwrap(), None);
+        assert_eq!(
+            top_level_field(br#"{"id":1,"id":2}"#, "id").unwrap(),
+            Some(serde_json::json!(2))
+        );
+        for broken in [&b"[1]"[..], b"plain", br#"{"id":1"#, br#"{"id":1} x"#] {
+            assert!(top_level_field(broken, "id").is_err());
+        }
+    }
+
+    fn chunk_documents<'a>(
+        messages: impl IntoIterator<Item = &'a CanonicalMessage>,
+        max_bytes: usize,
+    ) -> anyhow::Result<Vec<Vec<u8>>> {
+        let mut chunks = DocumentChunks::new(messages, max_bytes);
+        let mut bodies = Vec::new();
+        while let Some(body) = chunks.next_body()? {
+            bodies.push(body);
+        }
+        Ok(bodies)
+    }
+
+    #[test]
+    fn a_body_is_built_only_when_it_is_asked_for() {
+        let messages: Vec<_> = (1..=3).map(|id| message(id, None)).collect();
+        let mut read = 0;
+        let mut chunks = DocumentChunks::new(messages.iter().inspect(|_| read += 1), 1);
+        assert!(chunks.next_body().unwrap().is_some());
+        drop(chunks);
+        assert_eq!(read, 2, "only the first body and the line carried over");
     }
 
     #[test]
@@ -1052,15 +1567,93 @@ mod tests {
             code: String::new(),
             message: String::new(),
         };
-        assert!(is_retryable(&MeiliError::Transport(anyhow!("offline"))));
-        assert!(is_retryable(&status(429)));
-        assert!(is_retryable(&status(503)));
-        assert!(!is_retryable(&status(401)));
-        assert!(!is_retryable(&status(413)));
-        assert!(!is_retryable(&MeiliError::Task {
+        assert!(MeiliError::Transport(anyhow!("offline")).is_retryable());
+        assert!(status(429).is_retryable());
+        assert!(status(503).is_retryable());
+        assert!(!status(401).is_retryable());
+        assert!(!status(413).is_retryable());
+        assert!(!MeiliError::Task {
             code: "missing_document_id".to_owned(),
             message: String::new(),
-        }));
+        }
+        .is_retryable());
+    }
+
+    /// A stand-in Meilisearch whose one task stays `processing` for `slow`,
+    /// counting the document requests it is sent.
+    async fn slow_meilisearch(
+        slow: std::time::Duration,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::Ordering;
+
+        let writes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = writes.clone();
+        let mut enqueued = None;
+        let url = crate::client::stub::serve(move |request| {
+            if request.starts_with("POST /indexes/movies/documents") {
+                counted.fetch_add(1, Ordering::SeqCst);
+                enqueued.get_or_insert_with(std::time::Instant::now);
+                (202, r#"{"taskUid":7}"#.to_owned())
+            } else if enqueued.is_some_and(|at| at.elapsed() >= slow) {
+                (200, r#"{"status":"succeeded"}"#.to_owned())
+            } else {
+                (200, r#"{"status":"processing"}"#.to_owned())
+            }
+        })
+        .await;
+        (url, writes)
+    }
+
+    async fn stub_publisher(url: &str) -> Box<dyn MessagePublisher> {
+        create(
+            "movies",
+            &serde_json::json!({
+                "url": url,
+                "index": "movies",
+                "primary_key": "id",
+                "create_index": false,
+                "task_timeout_ms": 50,
+            }),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_task_slower_than_the_timeout_is_awaited_rather_than_resent() {
+        let slow = std::time::Duration::from_millis(400);
+        let (url, writes) = slow_meilisearch(slow).await;
+        let publisher = stub_publisher(&url).await;
+
+        let started = std::time::Instant::now();
+        let sent = publisher.send_batch(vec![message(1, None)]).await.unwrap();
+
+        assert!(matches!(sent, SentBatch::Ack), "the batch must not fail");
+        assert!(started.elapsed() >= slow);
+        assert_eq!(writes.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_task_meilisearch_no_longer_knows_is_sent_again() {
+        let url = crate::client::stub::serve(|request| {
+            if request.starts_with("POST") {
+                (202, r#"{"taskUid":7}"#.to_owned())
+            } else {
+                (
+                    404,
+                    r#"{"message":"Task `7` not found.","code":"task_not_found"}"#.to_owned(),
+                )
+            }
+        })
+        .await;
+        let publisher = stub_publisher(&url).await;
+
+        let sent = publisher.send_batch(vec![message(1, None)]).await.unwrap();
+
+        let SentBatch::Partial { failed, .. } = sent else {
+            panic!("a lost task must hand its batch back");
+        };
+        assert!(matches!(failed[0].1, PublisherError::Retryable(_)));
     }
 
     #[test]
@@ -1205,6 +1798,7 @@ mod tests {
             runs,
             rejected,
             stopped,
+            ..
         } = publisher.plan(&messages);
 
         assert!(stopped.is_none());

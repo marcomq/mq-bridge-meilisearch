@@ -29,6 +29,14 @@ fn factory() -> std::sync::Arc<dyn mq_bridge::traits::CustomEndpointFactory> {
         .expect("meilisearch endpoint factory should be registered")
 }
 
+/// `mqb copy` with no `--batch-size` asks the endpoint for one.
+#[test]
+fn the_host_reads_the_batch_size_the_endpoint_asks_for() {
+    register_once();
+    let asked = mq_bridge::extensions::endpoint_default_batch_size("meilisearch");
+    assert_eq!(asked, Some(50_000));
+}
+
 fn index_name(prefix: &str) -> String {
     format!("{prefix}-{}", uuid::Uuid::new_v4().simple())
 }
@@ -214,6 +222,218 @@ async fn update_merges_rows_from_different_tables_into_one_document() {
         assert_eq!(documents.len(), 1);
         assert_eq!(documents[0]["title"], "Stalker");
         assert_eq!(documents[0]["director"], "Tarkovsky");
+    })
+    .await;
+}
+
+/// The README's `_vectors` recipe, run as written: a vector arriving as a JSON
+/// string is stored as a vector, and a row carrying none is still indexed.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn the_readme_vector_recipe_stores_a_user_provided_vector() {
+    run_test_with_docker("tests/docker-compose.yml", || async {
+        let readme = include_str!("../README.md");
+        let recipe = readme
+            .split("```yaml\n")
+            .find(|block| block.contains("_vectors.default"))
+            .and_then(|block| block.split("```").next())
+            .expect("the README shows a `_vectors` recipe");
+        let recipe: serde_json::Value = serde_yaml::from_str(recipe).expect("valid YAML");
+        let output = &recipe["output"];
+        let endpoint: mq_bridge::models::Endpoint =
+            serde_json::from_value(output.clone()).expect("the README's output is an endpoint");
+        let settings = &output["custom"]["config"]["settings"];
+        let dimensions = settings["embedders"]["default"]["dimensions"]
+            .as_u64()
+            .expect("the embedder's dimensions");
+
+        let index = index_name("vectors");
+        let sink = factory()
+            .create_publisher(
+                &index,
+                &config(&index, serde_json::json!({"settings": settings})),
+            )
+            .await
+            .expect("create Meilisearch publisher");
+        let publisher =
+            mq_bridge::middleware::apply_middlewares_to_publisher(sink, &endpoint, &index)
+                .await
+                .expect("the README's transform compiles");
+
+        let vector = vec![0.5; dimensions as usize];
+        let embedded = serde_json::json!({
+            "id": 1,
+            "title": "Solaris",
+            "embedding": serde_json::to_string(&vector).unwrap(),
+        });
+        let bare = serde_json::json!({"id": 2, "title": null, "embedding": null});
+        let sent = publisher
+            .send_batch(vec![
+                CanonicalMessage::from(embedded.to_string()),
+                CanonicalMessage::from(bare.to_string()),
+            ])
+            .await
+            .expect("publish through the transform");
+        assert!(matches!(sent, SentBatch::Ack), "{sent:?}");
+
+        let stored = get(&format!(
+            "/indexes/{index}/documents/1?retrieveVectors=true"
+        ))
+        .await;
+        assert_eq!(stored["title"], "Solaris");
+        assert_eq!(
+            stored["_vectors"]["default"]["embeddings"][0],
+            serde_json::json!(vector)
+        );
+        assert!(
+            stored.get("embedding").is_none(),
+            "only mapped fields are indexed"
+        );
+        get(&format!("/indexes/{index}/documents/2")).await;
+    })
+    .await;
+}
+
+/// Rebuilds `live` from the example file through a real route, the only place
+/// a publisher is told how the route ended, and checks the swap happened.
+async fn a_drained_rebuild_goes_live(run: &str) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    let (build, live) = (format!("build-{run}"), format!("live-{run}"));
+    let endpoint = |index: &str, extra: serde_json::Value| {
+        let mut config = serde_json::json!({
+            "url": URL, "api_key": API_KEY, "index": index, "primary_key": "id",
+        });
+        config
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        config
+    };
+    let factory = mq_bridge::extensions::get_endpoint_factory("meilisearch")
+        .expect("the meilisearch endpoint is registered");
+    let stale =
+        CanonicalMessage::from(serde_json::json!({"id": 999, "title": "stale"}).to_string());
+    let old = factory
+        .create_publisher(&live, &endpoint(&live, serde_json::json!({})))
+        .await?;
+    old.send_batch(vec![stale]).await?;
+
+    let route: mq_bridge::Route = serde_json::from_value(serde_json::json!({
+        "exit_on_empty": true,
+        "input": {"file": {"path": "examples/movies.jsonl", "format": "raw"}},
+        "output": {"custom": {
+            "name": "meilisearch",
+            "config": endpoint(&build, serde_json::json!({"swap_into": live})),
+        }},
+    }))?;
+    route.run(&build).await?.join().await?;
+
+    let fetch = |index: String| async move {
+        reqwest::Client::new()
+            .get(format!("{URL}/indexes/{index}/documents?fields=id"))
+            .header("Authorization", format!("Bearer {API_KEY}"))
+            .send()
+            .await
+    };
+    let documents: serde_json::Value = serde_json::from_str(&fetch(live).await?.text().await?)?;
+    let stale_left = documents["results"]
+        .as_array()
+        .context("a documents page")?
+        .iter()
+        .any(|document| document["id"] == 999);
+    if documents["total"] != 3 || stale_left {
+        anyhow::bail!("the live index was not replaced by the rebuilt one: {documents}");
+    }
+    let leftover = fetch(build).await?.status();
+    if leftover != reqwest::StatusCode::NOT_FOUND {
+        anyhow::bail!("the build index should be gone after the swap, got {leftover}");
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires Docker"]
+async fn swap_into_puts_a_drained_rebuild_live_and_removes_the_build_index() {
+    run_test_with_docker("tests/docker-compose.yml", || async {
+        register_once();
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        a_drained_rebuild_goes_live(&run)
+            .await
+            .expect("a linked rebuild is swapped in");
+    })
+    .await;
+}
+
+/// A parent row that changes must reach the copy of it embedded in every child
+/// document, and leave the documents of other parents alone.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn update_where_refreshes_the_field_joined_into_other_documents() {
+    run_test_with_docker("tests/docker-compose.yml", || async {
+        let factory = factory();
+        let index = index_name("patch");
+        let filterable = serde_json::json!({"settings": {"filterableAttributes": ["author.id"]}});
+        let books = factory
+            .create_publisher(&index, &config(&index, filterable))
+            .await
+            .expect("create the publisher of the child documents");
+        let book = |id: u64, author: u64| {
+            let author = serde_json::json!({"id": author, "name": "old"});
+            let book =
+                serde_json::json!({"id": id, "title": format!("book {id}"), "author": author});
+            CanonicalMessage::from(book.to_string())
+        };
+        books
+            .send_batch(vec![book(1, 5), book(2, 5), book(3, 6)])
+            .await
+            .expect("index the child documents");
+
+        let authors = factory
+            .create_publisher(
+                &index,
+                &config(
+                    &index,
+                    serde_json::json!({
+                        "update_where": "author.id = ${payload:id}",
+                        "update_into": "author",
+                        "max_request_bytes": 40,
+                    }),
+                ),
+            )
+            .await
+            .expect("create the publisher of the parent rows");
+        let author = |id: u64, name: &str| {
+            CanonicalMessage::from(serde_json::json!({"id": id, "name": name}).to_string())
+        };
+        let sent = authors
+            .send_batch(vec![
+                author(5, "first"),
+                author(5, "new \"name\""),
+                author(7, "nobody"),
+            ])
+            .await
+            .expect("publish the parent changes");
+        assert!(matches!(sent, SentBatch::Ack));
+
+        let mut consumer = factory
+            .create_consumer(&index, &config(&index, serde_json::json!({})))
+            .await
+            .expect("create Meilisearch consumer");
+        let mut documents = read_all(&mut *consumer).await;
+        documents.sort_by_key(|document| document["id"].as_u64());
+
+        assert_eq!(documents.len(), 3, "a parent without children adds nothing");
+        for document in &documents[..2] {
+            assert_eq!(
+                document["author"],
+                serde_json::json!({"id": 5, "name": "new \"name\""})
+            );
+            assert!(
+                document["title"].is_string(),
+                "the rest of the document stays"
+            );
+        }
+        assert_eq!(documents[2]["author"]["name"], "old");
     })
     .await;
 }

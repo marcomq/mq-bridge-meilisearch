@@ -22,14 +22,18 @@ fn gzip(data: &[u8]) -> std::io::Result<Vec<u8>> {
 /// [`MeiliClient::create_index`] treats as success.
 const INDEX_ALREADY_EXISTS: &str = "index_already_exists";
 
+/// What a poll answers once the task it asks about no longer exists, as after
+/// a restore from an older snapshot.
+const TASK_NOT_FOUND: &str = "task_not_found";
+
 /// How a Meilisearch call failed. Kept apart from `anyhow` so the publisher and
 /// the consumer classify retryable and permanent failures from one place
 /// instead of matching on message text.
 #[derive(Debug)]
 pub(crate) enum MeiliError {
-    /// No response at all — DNS, connect, TLS, timeout — or a wait for an
-    /// enqueued task that gave up. Both are worth retrying: every write this
-    /// endpoint issues is keyed by primary key and so is idempotent.
+    /// No usable response — DNS, connect, TLS, timeout, or a body that is not
+    /// what Meilisearch sends. Worth retrying: every write this endpoint issues
+    /// is keyed by primary key and so is idempotent.
     Transport(anyhow::Error),
     /// Meilisearch answered, with a status outside 2xx.
     Status {
@@ -69,6 +73,16 @@ impl MeiliError {
             MeiliError::Status { code, .. } | MeiliError::Task { code, .. } => Some(code),
         }
     }
+
+    /// Which failures can heal on their own. A rejected key or a malformed
+    /// document cannot, and retrying it would only delay the dead letter.
+    pub(crate) fn is_retryable(&self) -> bool {
+        match self {
+            MeiliError::Transport(_) => true,
+            MeiliError::Status { status, .. } => matches!(status, 429 | 500 | 502 | 503 | 504),
+            MeiliError::Task { .. } => false,
+        }
+    }
 }
 
 /// The shape of every Meilisearch error body.
@@ -89,9 +103,31 @@ struct EnqueuedTask {
 
 #[derive(Debug, Deserialize)]
 struct TaskState {
+    #[serde(default)]
+    uid: u64,
     status: String,
     #[serde(default)]
     error: Option<ApiError>,
+}
+
+impl TaskState {
+    /// How the task ended, or `None` while it is still enqueued or processing.
+    fn outcome(&self) -> Option<Result<(), MeiliError>> {
+        match self.status.as_str() {
+            "succeeded" => Some(Ok(())),
+            "failed" | "canceled" => {
+                let error = self.error.as_ref();
+                Some(Err(MeiliError::Task {
+                    code: error
+                        .map(|error| error.code.clone())
+                        .filter(|code| !code.is_empty())
+                        .unwrap_or_else(|| self.status.clone()),
+                    message: error.map(|error| error.message.clone()).unwrap_or_default(),
+                }))
+            }
+            _ => None,
+        }
+    }
 }
 
 /// One page of `GET /indexes/{uid}/documents`.
@@ -257,6 +293,23 @@ impl MeiliClient {
         })
     }
 
+    /// Exchanges two indexes atomically and waits for the swap to be applied.
+    pub(crate) async fn swap_indexes(&self, first: &str, second: &str) -> Result<(), MeiliError> {
+        let body = serde_json::json!([{ "indexes": [first, second] }]);
+        let request = self
+            .request(reqwest::Method::POST, "/swap-indexes")
+            .header("Content-Type", "application/json")
+            .body(serde_json::to_vec(&body).unwrap_or_default());
+        let task = self.send_for_task(request).await?;
+        self.wait_for_task(task).await
+    }
+
+    pub(crate) async fn delete_index(&self, index: &str) -> Result<(), MeiliError> {
+        let request = self.request(reqwest::Method::DELETE, &format!("/indexes/{index}"));
+        let task = self.send_for_task(request).await?;
+        self.wait_for_task(task).await
+    }
+
     pub(crate) async fn delete_documents(
         &self,
         index: &str,
@@ -275,44 +328,113 @@ impl MeiliClient {
     /// Polls a task to a finished state. Meilisearch answers a write with 202
     /// and applies it afterwards, so a task that is still `enqueued` says
     /// nothing about whether the documents were accepted.
+    ///
+    /// It never gives up on a task that is still alive: Meilisearch does not
+    /// lose an enqueued task, so reporting a slow one as failed would have the
+    /// route resend documents that are about to be indexed anyway. Each
+    /// `task_timeout_ms` that passes is logged instead, and a poll that fails
+    /// transiently is repeated rather than failing the write it asks about.
     pub(crate) async fn wait_for_task(&self, task: u64) -> Result<(), MeiliError> {
         const FIRST_POLL: Duration = Duration::from_millis(10);
         const MAX_POLL: Duration = Duration::from_millis(50);
+        const MAX_SLOW_POLL: Duration = Duration::from_millis(250);
+        const MAX_FAILED_POLL: Duration = Duration::from_secs(1);
 
-        let deadline = Instant::now() + self.task_timeout;
+        let started = Instant::now();
+        let mut warn_at = started + self.task_timeout;
         let mut delay = FIRST_POLL;
         loop {
-            let body = self
-                .send(self.request(reqwest::Method::GET, &format!("/tasks/{task}")))
-                .await?;
-            let state: TaskState = serde_json::from_str(&body).map_err(|error| {
-                MeiliError::transport(anyhow!("unexpected Meilisearch task '{body}': {error}"))
-            })?;
-            match state.status.as_str() {
-                "succeeded" => return Ok(()),
-                "failed" | "canceled" => {
-                    let error = state.error.unwrap_or_default();
-                    return Err(MeiliError::Task {
-                        code: if error.code.is_empty() {
-                            state.status
-                        } else {
-                            error.code
-                        },
-                        message: error.message,
-                    });
+            let (waiting_on, limit) = match self.task_state(task).await {
+                Ok(state) => match state.outcome() {
+                    Some(outcome) => return outcome,
+                    // A task that has already run for seconds is polled less often.
+                    None => (
+                        format!("still '{}'", state.status),
+                        (started.elapsed() / 20).clamp(MAX_POLL, MAX_SLOW_POLL),
+                    ),
+                },
+                // The task is gone, and with it the write: only a resend restores it.
+                Err(error) if error.code() == Some(TASK_NOT_FOUND) => {
+                    return Err(MeiliError::transport(anyhow!(
+                        "Meilisearch no longer knows task {task}, so its write is lost and has to be sent again: {error}"
+                    )));
                 }
-                _ => {}
-            }
-            if Instant::now() >= deadline {
-                return Err(MeiliError::transport(anyhow!(
-                    "Meilisearch task {task} was still '{}' after {:?}; raise `task_timeout_ms` if indexing is simply slow",
-                    state.status,
-                    self.task_timeout
-                )));
+                Err(error) if error.is_retryable() => {
+                    (format!("cannot be polled: {error}"), MAX_FAILED_POLL)
+                }
+                Err(error) => return Err(error),
+            };
+            if Instant::now() >= warn_at {
+                tracing::warn!(
+                    task,
+                    waited = ?started.elapsed(),
+                    "Meilisearch task {waiting_on}; still waiting, since resending its documents would index them twice"
+                );
+                warn_at += self.task_timeout;
             }
             tokio::time::sleep(delay).await;
-            delay = (delay * 2).min(MAX_POLL);
+            delay = (delay * 2).min(limit);
         }
+    }
+
+    async fn task_state(&self, task: u64) -> Result<TaskState, MeiliError> {
+        let body = self
+            .send(self.request(reqwest::Method::GET, &format!("/tasks/{task}")))
+            .await?;
+        serde_json::from_str(&body).map_err(|error| {
+            MeiliError::transport(anyhow!("unexpected Meilisearch task '{body}': {error}"))
+        })
+    }
+
+    /// Waits for the tasks of one run, which target one index. Meilisearch
+    /// finishes an index's tasks in uid order, so the last one is waited for
+    /// and the others are then read in a single request, instead of polling
+    /// each in turn. Reports the first failure in uid order.
+    pub(crate) async fn wait_for_tasks(&self, tasks: &[u64]) -> Result<(), MeiliError> {
+        let Some((last, earlier)) = tasks.split_last() else {
+            return Ok(());
+        };
+        let last = self.wait_for_task(*last).await;
+        if earlier.is_empty() {
+            return last;
+        }
+        let states = self.task_states(earlier).await;
+        for task in earlier {
+            let known = states
+                .as_ref()
+                .ok()
+                .and_then(|states| states.iter().find(|state| state.uid == *task))
+                .and_then(TaskState::outcome);
+            match known {
+                Some(outcome) => outcome?,
+                None => self.wait_for_task(*task).await?,
+            }
+        }
+        last
+    }
+
+    async fn task_states(&self, tasks: &[u64]) -> Result<Vec<TaskState>, MeiliError> {
+        #[derive(Deserialize)]
+        struct Tasks {
+            results: Vec<TaskState>,
+        }
+        let uids = tasks
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let body = self
+            .send(
+                self.request(reqwest::Method::GET, "/tasks")
+                    .query(&[("uids", uids), ("limit", tasks.len().to_string())]),
+            )
+            .await?;
+        let tasks: Tasks = serde_json::from_str(&body).map_err(|error| {
+            MeiliError::transport(anyhow!(
+                "unexpected Meilisearch task list '{body}': {error}"
+            ))
+        })?;
+        Ok(tasks.results)
     }
 
     /// Reads one page of an index's documents. `/documents` rather than
@@ -379,11 +501,24 @@ impl MeiliClient {
         primary_key: &str,
         ids: &[String],
     ) -> Result<Vec<serde_json::Value>, MeiliError> {
-        let body = serde_json::json!({
-            "ids": ids,
-            "fields": [primary_key],
-            "limit": ids.len(),
-        });
+        self.fetch_ids(
+            index,
+            primary_key,
+            serde_json::json!({
+                "ids": ids,
+                "fields": [primary_key],
+                "limit": ids.len(),
+            }),
+        )
+        .await
+    }
+
+    async fn fetch_ids(
+        &self,
+        index: &str,
+        primary_key: &str,
+        body: serde_json::Value,
+    ) -> Result<Vec<serde_json::Value>, MeiliError> {
         let request = self
             .request(
                 reqwest::Method::POST,
@@ -404,10 +539,82 @@ impl MeiliClient {
             .collect())
     }
 
+    /// One page of the ids of the documents `filter` matches, in the order
+    /// `POST /documents/fetch` returns them.
+    pub(crate) async fn matching_ids(
+        &self,
+        index: &str,
+        primary_key: &str,
+        filter: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<serde_json::Value>, MeiliError> {
+        self.fetch_ids(
+            index,
+            primary_key,
+            serde_json::json!({
+                "filter": filter,
+                "fields": [primary_key],
+                "offset": offset,
+                "limit": limit,
+            }),
+        )
+        .await
+    }
+
     pub(crate) async fn health(&self) -> Result<(), MeiliError> {
         self.send(self.request(reqwest::Method::GET, "/health"))
             .await
             .map(|_| ())
+    }
+}
+
+/// A scripted stand-in for Meilisearch: answers each request with whatever
+/// `respond` returns for its request line (`GET /tasks/7`).
+#[cfg(test)]
+pub(crate) mod stub {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    pub(crate) async fn serve(
+        mut respond: impl FnMut(&str) -> (u16, String) + Send + 'static,
+    ) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 4096];
+                let head = loop {
+                    let read = socket.read(&mut buffer).await.unwrap();
+                    request.extend_from_slice(&buffer[..read]);
+                    if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break String::from_utf8_lossy(&request[..end]).into_owned();
+                    }
+                };
+                let length = head
+                    .lines()
+                    .find_map(|line| {
+                        line.to_lowercase()
+                            .strip_prefix("content-length:")?
+                            .trim()
+                            .parse()
+                            .ok()
+                    })
+                    .unwrap_or(0usize);
+                while request.len() < head.len() + 4 + length {
+                    let read = socket.read(&mut buffer).await.unwrap();
+                    request.extend_from_slice(&buffer[..read]);
+                }
+                let (status, body) = respond(head.lines().next().unwrap_or_default());
+                let response = format!(
+                    "HTTP/1.1 {status} Stub\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        url
     }
 }
 
@@ -486,6 +693,37 @@ mod tests {
         let mut decoded = Vec::new();
         std::io::Read::read_to_end(&mut flate2::read::GzDecoder::new(sent), &mut decoded).unwrap();
         assert_eq!(Some(decoded.as_slice()), plain.body().unwrap().as_bytes());
+    }
+
+    #[tokio::test]
+    async fn the_tasks_of_a_run_are_read_together_once_the_last_is_done() {
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = requests.clone();
+        let url = stub::serve(move |request| {
+            seen.lock().unwrap().push(request.to_owned());
+            if request.starts_with("GET /tasks?") {
+                let failed = r#"{"uid":2,"status":"failed","error":{"code":"invalid_document_geo_field","message":"bad"}}"#;
+                (
+                    200,
+                    format!(r#"{{"results":[{failed},{{"uid":1,"status":"succeeded"}}]}}"#),
+                )
+            } else {
+                (200, r#"{"uid":3,"status":"succeeded"}"#.to_owned())
+            }
+        })
+        .await;
+        let client = MeiliClient::new(&config(&url)).unwrap();
+
+        let outcome = client.wait_for_tasks(&[1, 2, 3]).await;
+
+        assert_eq!(
+            outcome.unwrap_err().code(),
+            Some("invalid_document_geo_field")
+        );
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2, "{requests:?}");
+        assert!(requests[0].starts_with("GET /tasks/3 "), "{requests:?}");
+        assert!(requests[1].contains("uids=1%2C2"), "{requests:?}");
     }
 
     #[test]

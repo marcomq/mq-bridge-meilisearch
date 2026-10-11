@@ -258,6 +258,62 @@ fn a_uri_maps_onto_the_declared_schema() {
         .expect("the mapped configuration deserializes");
 }
 
+/// Rebuilds `live` from the example file through a real route, the only place
+/// a publisher is told how the route ended, and checks the swap happened.
+async fn a_drained_rebuild_goes_live(run: &str) -> anyhow::Result<()> {
+    let (build, live) = (format!("build-{run}"), format!("live-{run}"));
+    let endpoint = |index: &str, extra: serde_json::Value| {
+        let mut config = serde_json::json!({
+            "url": URL, "api_key": API_KEY, "index": index, "primary_key": "id",
+        });
+        config
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        config
+    };
+    let factory = mq_bridge::extensions::get_endpoint_factory("meilisearch")
+        .context("the meilisearch endpoint is registered")?;
+    let stale =
+        CanonicalMessage::from(serde_json::json!({"id": 999, "title": "stale"}).to_string());
+    let old = factory
+        .create_publisher(&live, &endpoint(&live, serde_json::json!({})))
+        .await?;
+    old.send_batch(vec![stale]).await?;
+
+    let route: mq_bridge::Route = serde_json::from_value(serde_json::json!({
+        "exit_on_empty": true,
+        "input": {"file": {"path": "examples/movies.jsonl", "format": "raw"}},
+        "output": {"custom": {
+            "name": "meilisearch",
+            "config": endpoint(&build, serde_json::json!({"swap_into": live})),
+        }},
+    }))?;
+    route.run(&build).await?.join().await?;
+
+    let fetch = |index: String| async move {
+        reqwest::Client::new()
+            .get(format!("{URL}/indexes/{index}/documents?fields=id"))
+            .header("Authorization", format!("Bearer {API_KEY}"))
+            .send()
+            .await
+    };
+    let documents: serde_json::Value = serde_json::from_str(&fetch(live).await?.text().await?)?;
+    let stale_left = documents["results"]
+        .as_array()
+        .context("a documents page")?
+        .iter()
+        .any(|document| document["id"] == 999);
+    if documents["total"] != 3 || stale_left {
+        bail!("the live index was not replaced by the rebuilt one: {documents}");
+    }
+    let leftover = fetch(build).await?.status();
+    if leftover != reqwest::StatusCode::NOT_FOUND {
+        bail!("the build index should be gone after the swap, got {leftover}");
+    }
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Docker"]
 async fn the_endpoint_behaves_the_same_linked_directly_and_loaded_as_a_plugin() {
@@ -271,7 +327,7 @@ async fn the_endpoint_behaves_the_same_linked_directly_and_loaded_as_a_plugin() 
         let library = build_plugin_cdylib(".", "mq-bridge-meilisearch").expect("build the plugin");
         let info = load_endpoint_plugin(&library).expect("load the plugin");
         assert_eq!(info.name, "meilisearch");
-        assert_eq!((info.abi_major, info.abi_minor), (1, 2));
+        assert_eq!((info.abi_major, info.abi_minor), (1, 3));
         assert!(info.supports_consumer && info.supports_publisher);
         let factory = mq_bridge::extensions::get_endpoint_factory(&info.name)
             .expect("loading a plugin registers its endpoint");
@@ -281,6 +337,12 @@ async fn the_endpoint_behaves_the_same_linked_directly_and_loaded_as_a_plugin() 
             .expect("the plugin-loaded endpoint should pass the same suite");
 
         assert_eq!(direct, loaded);
+
+        // Needs plugin ABI 1.3: an older table never tells the plugin that the
+        // route drained, and the rebuilt index would stay unswapped.
+        a_drained_rebuild_goes_live(&run)
+            .await
+            .expect("a plugin-loaded rebuild is swapped in");
     })
     .await;
 }

@@ -114,6 +114,24 @@ pub struct MeilisearchConfig {
     #[serde(default)]
     #[schemars(schema_with = "write_method_schema")]
     pub method: WriteMethod,
+    /// Output only: makes each message a patch for every document it matches,
+    /// instead of a document of its own. Written as `<attribute> = <value>`,
+    /// e.g. `author.id = ${payload:id}`: the message is merged into the
+    /// `update_into` field of each document whose filterable `<attribute>`
+    /// equals the value. This is how a changed parent row reaches the documents
+    /// that embed it. Needs `primary_key` and `update_into`.
+    #[serde(default)]
+    pub update_where: Option<String>,
+    /// Output only: the top-level document field a message matched by
+    /// `update_where` is written to, replacing that field whole.
+    #[serde(default)]
+    pub update_into: Option<String>,
+    /// Output only: the live index this route rebuilds. Documents are written
+    /// to `index`; once the input is drained to its end without a failed
+    /// write, `index` is swapped with this one and then deleted. Needs
+    /// mq-bridge 0.4.18 or newer; an older host never swaps.
+    #[serde(default)]
+    pub swap_into: Option<String>,
     /// Output only: index settings forwarded verbatim to
     /// `PATCH /indexes/{uid}/settings` when the index is created, e.g.
     /// `searchableAttributes` or `filterableAttributes`. The call merges only
@@ -138,7 +156,8 @@ pub struct MeilisearchConfig {
     /// which commits the source cursor for writes that may still fail.
     #[serde(default = "default_true")]
     pub wait_for_task: bool,
-    /// How long to wait for one enqueued task, in milliseconds.
+    /// How long one enqueued task may take, in milliseconds, before a warning
+    /// is logged. The wait itself continues: a slow task is never resent.
     #[serde(default = "default_task_timeout_ms")]
     pub task_timeout_ms: u64,
     /// Output only: the largest document request this endpoint will send. A run
@@ -197,8 +216,16 @@ fn compression_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
 ///
 /// Derived rather than written out, so it cannot drift from the struct.
 pub(crate) fn config_schema() -> Option<serde_json::Value> {
-    serde_json::to_value(schemars::schema_for!(MeilisearchConfig)).ok()
+    let mut schema = serde_json::to_value(schemars::schema_for!(MeilisearchConfig)).ok()?;
+    schema[DEFAULT_BATCH_SIZE_HINT] = DEFAULT_BATCH_SIZE.into();
+    Some(schema)
 }
+
+/// The schema annotation a host (mq-bridge 0.4.18+) reads for the batch size to
+/// use when the user gave none. Meilisearch indexes one large request far
+/// faster than many small ones.
+const DEFAULT_BATCH_SIZE_HINT: &str = "x-mqb-default-batch-size";
+const DEFAULT_BATCH_SIZE: u64 = 50_000;
 
 /// Rewrites a `meilisearch://` URL to the HTTP one Meilisearch actually speaks.
 ///
@@ -223,6 +250,25 @@ fn normalize_url(url: &str) -> String {
 /// the publisher can honour that; a reader pages through one concrete index.
 pub(crate) fn is_template(value: &str) -> bool {
     value.contains("${")
+}
+
+/// Splits `update_where` into the attribute it compares and the value template.
+/// Only equality is accepted, so the endpoint can quote the value itself and a
+/// value read from a message can never widen the filter.
+pub(crate) fn split_update_where(condition: &str) -> anyhow::Result<(&str, &str)> {
+    let malformed = || {
+        anyhow!(
+            "Meilisearch `update_where` must be `<attribute> = <value>`, e.g. `author.id = ${{payload:id}}`; got '{condition}'"
+        )
+    };
+    let (attribute, value) = condition.split_once('=').ok_or_else(malformed)?;
+    let attribute = attribute.trim();
+    let value = value.trim().trim_matches(['"', '\'']);
+    let plain = |byte: u8| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.');
+    if attribute.is_empty() || value.is_empty() || !attribute.bytes().all(plain) {
+        return Err(malformed());
+    }
+    Ok((attribute, value))
 }
 
 pub(crate) fn resolve_for_consumer(
@@ -275,6 +321,52 @@ pub(crate) fn resolve(
             ));
         }
     }
+    match (&config.update_where, &config.update_into) {
+        (None, None) => {}
+        (Some(condition), Some(into)) => {
+            split_update_where(condition)?;
+            if into.trim().is_empty() || into.contains('.') {
+                return Err(anyhow!(
+                    "Meilisearch `update_into` must name one top-level document field, since an update merges top-level fields only"
+                ));
+            }
+            if config.primary_key.is_none() {
+                return Err(anyhow!(
+                    "Meilisearch `primary_key` is required with `update_where`, so each matching document can be named"
+                ));
+            }
+            // A patch names no document of its own, so it has nothing to delete
+            // or to look up.
+            if config.operation.is_some() || config.method == WriteMethod::UpdateExisting {
+                return Err(anyhow!(
+                    "Meilisearch `update_where` cannot be combined with `operation` or `method: update_existing`: it always merges into the documents it matches"
+                ));
+            }
+        }
+        _ => {
+            return Err(anyhow!(
+                "Meilisearch `update_where` and `update_into` are set together: the first selects the documents, the second names the field the message is written to"
+            ));
+        }
+    }
+    if let Some(live) = &config.swap_into {
+        if live.trim().is_empty() || is_template(live) || is_template(&index) {
+            return Err(anyhow!(
+                "Meilisearch `swap_into` and the `index` it rebuilds must both be fixed index names"
+            ));
+        }
+        if *live == index {
+            return Err(anyhow!(
+                "Meilisearch `swap_into` names the index being written: build under another `index` and swap it into '{live}'"
+            ));
+        }
+        // A swap is only safe once every write is known to have been applied.
+        if !config.wait_for_task || config.update_where.is_some() {
+            return Err(anyhow!(
+                "Meilisearch `swap_into` cannot be combined with `wait_for_task: false` or `update_where`: it swaps in an index whose every write was confirmed"
+            ));
+        }
+    }
     if config.max_request_bytes == 0 {
         return Err(anyhow!(
             "Meilisearch `max_request_bytes` must be greater than 0"
@@ -309,6 +401,117 @@ mod tests {
         assert_eq!(config.delete_values, vec!["delete".to_owned()]);
         assert!(config.create_index);
         assert!(config.wait_for_task);
+    }
+
+    #[test]
+    fn update_where_splits_into_an_attribute_and_a_value_template() {
+        let split = |condition| split_update_where(condition).unwrap();
+        assert_eq!(
+            split("author.id = ${payload:id}"),
+            ("author.id", "${payload:id}")
+        );
+        assert_eq!(
+            split("author_id=\"${payload:id}\""),
+            ("author_id", "${payload:id}")
+        );
+        for malformed in [
+            "author.id",
+            "= 5",
+            "author.id =",
+            "a OR b = 5",
+            "a > 5 AND b = 1",
+        ] {
+            assert!(split_update_where(malformed).is_err(), "{malformed}");
+        }
+    }
+
+    #[test]
+    fn update_where_needs_a_field_to_write_and_a_key_to_name_documents() {
+        let patch = |extra: serde_json::Value| {
+            let mut config = serde_json::json!({
+                "primary_key": "id",
+                "update_where": "author.id = ${payload:id}",
+                "update_into": "author",
+            });
+            let object = config.as_object_mut().unwrap();
+            for (key, item) in extra.as_object().unwrap() {
+                object.insert(key.clone(), item.clone());
+            }
+            resolve("books", &value(config))
+        };
+        assert!(patch(serde_json::json!({})).is_ok());
+        assert!(patch(serde_json::json!({"update_into": null})).is_err());
+        assert!(patch(serde_json::json!({"update_where": null})).is_err());
+        assert!(patch(serde_json::json!({"update_into": "author.name"})).is_err());
+        assert!(patch(serde_json::json!({"primary_key": null})).is_err());
+        assert!(patch(serde_json::json!({"operation": "${metadata:op}"})).is_err());
+        assert!(patch(serde_json::json!({"method": "update_existing"})).is_err());
+    }
+
+    /// The YAML blocks of the README, parsed.
+    fn readme_examples() -> Vec<serde_yaml::Value> {
+        let readme = include_str!("../README.md");
+        let blocks = readme.split("```yaml\n").skip(1);
+        blocks
+            .map(|block| block.split("```").next().unwrap())
+            .map(|yaml| {
+                serde_yaml::from_str(yaml).unwrap_or_else(|error| panic!("{error}:\n{yaml}"))
+            })
+            .collect()
+    }
+
+    /// Resolves every `custom: {name: meilisearch, config}` under `node` the way
+    /// a route would, and returns how many it found.
+    fn resolve_endpoints(node: &serde_yaml::Value, input: bool) -> usize {
+        let Some(map) = node.as_mapping() else {
+            let items = node.as_sequence().into_iter().flatten();
+            return items.map(|item| resolve_endpoints(item, input)).sum();
+        };
+        let mut found = 0;
+        if map.get("name").and_then(|name| name.as_str()) == Some("meilisearch") {
+            let config = serde_json::to_value(&map["config"]).unwrap();
+            let outcome = if input {
+                resolve_for_consumer("route", &config).map(drop)
+            } else {
+                resolve("route", &config).map(drop)
+            };
+            outcome.unwrap_or_else(|error| panic!("{error}:\n{config:#}"));
+            found += 1;
+        }
+        for (key, child) in map {
+            found += resolve_endpoints(child, input || key.as_str() == Some("input"));
+        }
+        found
+    }
+
+    #[test]
+    fn every_configuration_the_readme_shows_is_accepted() {
+        let examples = readme_examples();
+        let found: usize = examples
+            .iter()
+            .map(|example| resolve_endpoints(example, false))
+            .sum();
+        assert!(
+            found >= 8,
+            "only {found} Meilisearch endpoints found in the README"
+        );
+    }
+
+    #[test]
+    fn swap_into_needs_two_fixed_indexes_and_confirmed_writes() {
+        let rebuild = |extra: serde_json::Value| {
+            let mut config = serde_json::json!({"index": "movies_v2", "swap_into": "movies"});
+            let object = config.as_object_mut().unwrap();
+            for (key, item) in extra.as_object().unwrap() {
+                object.insert(key.clone(), item.clone());
+            }
+            resolve("route", &value(config))
+        };
+        assert!(rebuild(serde_json::json!({})).is_ok());
+        assert!(rebuild(serde_json::json!({"swap_into": "movies_v2"})).is_err());
+        assert!(rebuild(serde_json::json!({"swap_into": "${metadata:table}"})).is_err());
+        assert!(rebuild(serde_json::json!({"index": "${metadata:table}"})).is_err());
+        assert!(rebuild(serde_json::json!({"wait_for_task": false})).is_err());
     }
 
     #[test]
